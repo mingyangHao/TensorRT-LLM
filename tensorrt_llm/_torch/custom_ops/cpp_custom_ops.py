@@ -683,6 +683,23 @@ def _register_fake():
                                 dtype=torch.float8_e4m3fn), input.new_empty(
                                     (m, num_packed_sf_k), dtype=torch.int32)
 
+    @torch.library.register_fake("trtllm::dsv4_fused_qa_fp8_out")
+    def _(a_fp8: torch.Tensor,
+          a_sf: torch.Tensor,
+          b_fp8: torch.Tensor,
+          b_sf: torch.Tensor,
+          use_single_cta: bool = False):
+        # D = A @ B^T quantized to fp8 [M, N], plus the packed-UE8M0 output scale stored physically
+        # as [num_packed_sf_k, m_aligned] int32 (matches cpp/tensorrt_llm/thop/dsv4FusedQaOp.cpp).
+        M, _ = a_fp8.shape
+        N = b_fp8.shape[0]
+        num_n_blocks = (N + 127) // 128
+        num_packed_sf_k = (num_n_blocks + 3) // 4
+        m_aligned = (M + 3) // 4 * 4
+        d_fp8 = a_fp8.new_empty((M, N), dtype=torch.float8_e4m3fn)
+        d_sf = a_fp8.new_empty((num_packed_sf_k, m_aligned), dtype=torch.int32)
+        return d_fp8, d_sf
+
     @torch.library.register_fake("trtllm::causal_conv1d_fwd")
     def _(
         x: torch.Tensor,

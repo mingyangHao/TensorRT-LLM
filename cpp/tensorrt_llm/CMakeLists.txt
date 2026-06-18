@@ -202,6 +202,7 @@ set(TRTLLM_LINK_LIBS
     testing_src
     mhcKernels_src
     compressorKernels_src
+    dsv4_fused_qa_src
     userbuffers_src
     ${DECODER_SHARED_TARGET_0}
     ${DECODER_SHARED_TARGET_1})

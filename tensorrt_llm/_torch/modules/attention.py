@@ -1207,6 +1207,24 @@ def _q_b_proj_cute_dsl_bf16(q: torch.Tensor,
     return out
 
 
+def _select_dsv4_fused_qa_path(enabled: bool, num_tokens: int, min_m: int,
+                               onecta_min_m: int) -> str:
+    """Route the DeepSeek-V4 q_a projection given the active token count and the two fused thresholds.
+
+    Returns one of '2cta' | '1cta' | 'nonfused'. Ordering (independent of how min_m and onecta_min_m
+    compare): large M >= min_m uses the 2-CTA kernel (pad to 256); smaller M in
+    [onecta_min_m, min_m) uses the single-CTA variant (pad to 128); below that, the non-fused fallback.
+    When onecta_min_m >= min_m the single-CTA window is empty, so decode < min_m goes straight to
+    non-fused and M >= min_m still uses 2-CTA (no token count is ever mis-routed to non-fused)."""
+    if not enabled:
+        return "nonfused"
+    if num_tokens >= min_m:
+        return "2cta"
+    if num_tokens >= onecta_min_m:
+        return "1cta"
+    return "nonfused"
+
+
 class MLA(nn.Module):
 
     def __init__(
@@ -1375,6 +1393,47 @@ class MLA(nn.Module):
             self.q_a_layernorm = RMSNorm(hidden_size=self.q_lora_rank,
                                          eps=rms_norm_eps,
                                          dtype=dtype)
+            # DSV4-only: fuse the q-slice GEMM + (gamma-folded) drop-RMS + fp8-quant into one
+            # fused fp8-out kernel (torch.ops.trtllm.dsv4_fused_qa_fp8_out). Off by default;
+            # restricted to the SM100 family (B200 sm_100 + B300 sm_103) -- the tcgen05 kernel is
+            # built as a 100f-real family cubin and the op/device guards accept both; on other GPUs
+            # the non-fused path runs. Folded weights are built once in post_load_weights() (split
+            # kv_a_proj, fold q_a_layernorm gamma into the q-slice weight).
+            self._dsv4_fused_qa = bool(
+                self.is_deepseek_v4
+                and int(os.environ.get("TRTLLM_DSV4_FUSED_QA", "0"))
+                and is_sm_100f())
+            self._fused_qa_built = False
+            # The fused 2-CTA kernel pads M up to a multiple of 256 (cluster granularity), which wastes
+            # compute at small (decode) token counts. Below this many tokens the q-path runs the
+            # non-fused fallback; at or above it the fused path keeps the large-M speedup. Default 256
+            # (one cluster tile) routes decode to the fallback floor; env-overridable for tuning.
+            # Must be >= 1: M (the flattened active-token count) is always >= 1, so a value of 1 means
+            # "always fuse" (no floor) and any value <= 0 would silently disable the floor and re-enable
+            # the padded path for decode -- reject it explicitly rather than fail open.
+            self._fused_qa_min_m = int(
+                os.environ.get("TRTLLM_DSV4_FUSED_QA_MIN_M", "256"))
+            if self._dsv4_fused_qa and self._fused_qa_min_m < 1:
+                raise ValueError(
+                    "TRTLLM_DSV4_FUSED_QA_MIN_M must be >= 1 (got "
+                    f"{self._fused_qa_min_m}); it is the minimum active-token count "
+                    "(M) for the fused q-path. Use 1 to always fuse (no decode "
+                    "fallback floor); larger values keep decode on the non-fused path."
+                )
+            # Small-M (decode) below _fused_qa_min_m can use the single-CTA fused variant (cluster_n=1,
+            # pads M to 128 instead of 256) instead of the non-fused fallback: fused for tokens M in
+            # [_fused_qa_1cta_min_m, _fused_qa_min_m). Default = _fused_qa_min_m, i.e. OFF -- decode stays
+            # on the non-fused floor (no regression vs the 2-CTA-only path). Lower it (env) to route
+            # decode through the single-CTA variant once an e2e crossover bench shows it beats non-fused.
+            self._fused_qa_1cta_min_m = int(
+                os.environ.get("TRTLLM_DSV4_FUSED_QA_1CTA_MIN_M",
+                               str(self._fused_qa_min_m)))
+            if self._dsv4_fused_qa and self._fused_qa_1cta_min_m < 1:
+                raise ValueError(
+                    "TRTLLM_DSV4_FUSED_QA_1CTA_MIN_M must be >= 1 (got "
+                    f"{self._fused_qa_1cta_min_m}); it is the minimum M routed to the "
+                    "single-CTA fused variant. Set it >= TRTLLM_DSV4_FUSED_QA_MIN_M to "
+                    "disable the single-CTA path (decode -> non-fused).")
 
             self.q_b_proj = Linear(
                 self.q_lora_rank,
@@ -2094,6 +2153,96 @@ class MLA(nn.Module):
                               indexer_intermediates, position_ids,
                               attn_metadata, output)
 
+    def _build_fused_qa_weights(self):
+        """Split kv_a_proj_with_mqa weight at q_lora_rank, fold q_a_layernorm gamma into the q-slice
+        (drop RMS), produce the fused-op B operands + the bf16 kv-slice GEMM weight. Called once from
+        post_load_weights() (before warmup/CUDA-graph capture)."""
+        from ...quantization.utils.fp8_utils import \
+            transform_sf_into_required_layout
+        from ..custom_ops.dsv4_fused_qa import build_fused_qa_weights
+        built = build_fused_qa_weights(self.kv_a_proj_with_mqa.weight,
+                                       self.kv_a_proj_with_mqa.weight_scale,
+                                       self.q_a_layernorm.weight,
+                                       self.q_lora_rank)
+        self._W_q_fp8 = built["W_q_fp8"]
+        self._W_q_sfb = built["W_q_sfb"]
+        self._W_kvrope_fp8 = built["W_kvrope_fp8"]
+        self._W_kvrope_scale = built["W_kvrope_scale"]
+        # q_b_proj keeps FP8BlockScalesLinearMethod's FLOAT [nb,kb] weight scale; the fused path feeds
+        # q_b directly through deep_gemm, which needs the packed (mn-major, TMA-aligned) layout. Transform
+        # once here (a raw float scale would make deep_gemm emit NaN).
+        self._q_b_scale_dg = transform_sf_into_required_layout(
+            self.q_b_proj.weight_scale,
+            mn=self.q_b_proj.weight.shape[0],
+            k=self.q_b_proj.weight.shape[1],
+            recipe=(1, 128, 128),
+            is_sfa=False)
+        self._fused_qa_built = True
+
+    def _warmup_fused_qa(self):
+        """Run the fused fp8-out GEMM once on a dummy input so the kernel launcher's one-time setup
+        (device queries + cudaFuncSetAttribute) happens here, before any CUDA-graph capture. After this
+        warmup the capturable forward path does only the cluster launch + ordinary tensor work; any
+        intermediate allocations it makes (the realigned scale buffer, the deep_gemm outputs) come from
+        the CUDA-graph private memory pool during capture, so capture/replay is safe (verified by
+        test_dsv4_fused_qa_wrapper_cuda_graph). Both the 2-CTA and single-CTA launchers cache their setup
+        independently, so warm both (each kernel has its own cudaFuncSetAttribute)."""
+        from ..custom_ops.dsv4_fused_qa import run_fused_qa_qpath
+        k = self._W_q_fp8.shape[1]
+        dummy_hidden = torch.zeros((256, k),
+                                   dtype=torch.bfloat16,
+                                   device=self._W_q_fp8.device)
+        run_fused_qa_qpath(dummy_hidden, self._W_q_fp8, self._W_q_sfb)
+        run_fused_qa_qpath(dummy_hidden,
+                           self._W_q_fp8,
+                           self._W_q_sfb,
+                           single_cta=True)
+
+    def _forward_dsv4_fused_qkv(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        use_single_cta: bool = False,
+    ):
+        """Fused q_a path for DeepSeek-V4 (TRTLLM_DSV4_FUSED_QA, SM100 family). Replaces the q-slice GEMM
+        + q_a_layernorm + q_b_proj's internal fp8-quant with one fp8-out GEMM: the gamma-folded,
+        RMS-dropped q-slice is emitted as fp8 (qr_fp8) and fed to q_b_proj directly via deep_gemm; the
+        kv/rope slice runs as a bf16 deep_gemm reusing the once-quantized hidden. Returns
+        (q, qr, compressed_kv, k_pe, latent_cache) matching the non-fused V4 branch: q is through the
+        unweighted per-head q_b_layernorm, qr is the dequantized (RMS-dropped) q_a output for the
+        indexer, and kv_a_layernorm is applied to the full kv slice before splitting (V4 convention)."""
+        from ..custom_ops.dsv4_fused_qa import (deep_gemm_nt_out,
+                                                dequant_qr_to_bf16,
+                                                run_fused_qa_qpath)
+        num_tokens = hidden_states.shape[0]
+        # Fused fp8-out q-slice (gamma folded, RMS dropped); the padded quantized hidden feeds the kv GEMM.
+        # use_single_cta routes small (decode) M through the cluster_n=1 variant (pad to 128 vs 256).
+        qr_fp8, qr_sf_view, hp_fp8, hp_sf, _ = run_fused_qa_qpath(
+            hidden_states,
+            self._W_q_fp8,
+            self._W_q_sfb,
+            single_cta=use_single_cta)
+        # kv + rope via bf16 deep_gemm on the split kv/rope weight; V4 norms the FULL kv before splitting.
+        kv = deep_gemm_nt_out(hp_fp8, hp_sf, self._W_kvrope_fp8,
+                              self._W_kvrope_scale, hidden_states.dtype,
+                              num_tokens)
+        kv = self.kv_a_layernorm(kv)
+        compressed_kv, k_pe = kv.split(
+            [self.kv_lora_rank, self.qk_rope_head_dim], -1)
+        latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
+        # q_b_proj consumes the fused (qr_fp8, qr_sf) directly, then the unweighted per-head q_b_layernorm.
+        # _q_b_scale_dg is q_b_proj.weight_scale pre-transformed to deep_gemm's packed layout (built once).
+        q = deep_gemm_nt_out(qr_fp8, qr_sf_view, self.q_b_proj.weight,
+                             self._q_b_scale_dg, hidden_states.dtype,
+                             num_tokens)
+        q = self.q_b_layernorm(q.view(-1, self.qk_head_dim)).view_as(q)
+        # Indexer reads the dequantized (RMS-dropped) qr; the wq_b path stays unfused for now.
+        qr = dequant_qr_to_bf16(qr_fp8, qr_sf_view,
+                                self.q_lora_rank).to(hidden_states.dtype)
+        if self.compressor is not None:
+            self.compressor(hidden_states, attn_metadata)
+        return q, qr, compressed_kv, k_pe, latent_cache
+
     def forward_dsa_proj(
         self,
         position_ids: Optional[torch.Tensor],
@@ -2283,173 +2432,208 @@ class MLA(nn.Module):
         if position_ids is not None:
             position_ids = position_ids[..., :num_tokens]
 
-        # TRTLLM_MLA_EXTRA_OVERLAP=1 reorders the V4 attention prologue so the
-        # outer compressor and the ratio-4 indexer can execute concurrently
-        # with q_b_proj + q_b_layernorm. The indexer is launched on a
-        # dedicated stream and still uses a different aux stream for its
-        # internal q-proj/weights-proj split.
-        _v4_extra_overlap = (os.environ.get("TRTLLM_MLA_EXTRA_OVERLAP", "1")
-                             == "1" and self.compressor is not None
-                             and self.aux_stream is not None)
-        _use_indexer_overlap = (_v4_extra_overlap and do_multi_stream()
-                                and self.indexer is not None
-                                and self.indexer_stream is not None)
-
-        # Pre-launch the outer compressor on compressor_stream BEFORE
-        # kv_a_proj_with_mqa. The compressor only reads hidden_states +
-        # attn_metadata, so it has no data dependency on the kv_a_proj GEMM or
-        # the downstream q_a/kv_a LN split. A dedicated stream (not aux_stream)
-        # keeps kv_a_layernorm free to run on aux_stream in parallel.
-        # _q_branch will be queued onto this same stream further down so it
-        # runs strictly serial after the compressor; dsv4_compressor_event is
-        # recorded only at the end of _q_branch, gating the caller's downstream
-        # waits on both compressor + _q_branch completion.
-        if _use_indexer_overlap:
-            self.dsv4_compressor_start_event.record()
-            with torch.cuda.stream(self.compressor_stream):
-                self.dsv4_compressor_start_event.wait()
-                self.compressor(hidden_states, attn_metadata)
-
-        # Pre-launch the qr-independent half of the indexer prepare phase
-        # (weights_proj + internal compressor + k_cache_update) on the
-        # indexer's aux stream (self.indexer_aux_stream — wired into the
-        # indexer module as its aux_stream). Only reads hidden_states +
-        # attn_metadata, so it can overlap with the kv_a_proj → LN → split
-        # chain on the caller stream and the outer compressor on
-        # compressor_stream. The returned tuple is fed back into
-        # self.indexer() via pre_aux so the later _indexer_branch skips its
-        # own aux-stream launch.
+        # Fused q_a path gate (TRTLLM_DSV4_FUSED_QA, SM100 family only): one fp8-out GEMM replaces
+        # the q-slice GEMM + q_a_layernorm + q_b_proj's fp8-quant and returns q (already through
+        # q_b_layernorm), qr (the dequantized RMS-dropped q_a output the indexer consumes),
+        # compressed_kv, k_pe, latent_cache. Routing: M >= _fused_qa_min_m -> 2-CTA (pad 256); M in
+        # [_fused_qa_1cta_min_m, _fused_qa_min_m) -> single-CTA (pad 128); else non-fused (default
+        # _fused_qa_1cta_min_m == _fused_qa_min_m, so decode stays non-fused). When fused, the
+        # multi-stream prologue overlap is bypassed (the fused q path is a single fast GEMM); the
+        # compressor runs here and the indexer in the common tail below.
+        _fused_qa_path = _select_dsv4_fused_qa_path(self._dsv4_fused_qa,
+                                                    hidden_states.shape[0],
+                                                    self._fused_qa_min_m,
+                                                    self._fused_qa_1cta_min_m)
+        topk_indices = None
+        indexer_ran = False
         _indexer_pre_aux = None
-        if _use_indexer_overlap:
-            _indexer_pre_aux = self.indexer.precompute_aux(
-                hidden_states, attn_metadata)
+        if _fused_qa_path != "nonfused":
+            q, qr, compressed_kv, k_pe, latent_cache = self._forward_dsv4_fused_qkv(
+                hidden_states,
+                attn_metadata,
+                use_single_cta=(_fused_qa_path == "1cta"))
+            # The fused op returns q already through q_b_layernorm (a plain bf16 q), so the downstream
+            # sparse-MLA must take its non-fused-q path. Clear the upstream fused-FP8-q buffers (the
+            # `_deepseek_v4_q_b_layernorm_fused_fp8` stash that gates `use_fused_q_fp8`) so a stale buffer
+            # from a prior non-fused iteration can never mis-route this fused q to the FP8-q attention.
+            self._fused_quant_q_buffer = None
+            self._fused_q_pe = None
+            if self.compressor is not None:
+                self.compressor(hidden_states, attn_metadata)
+        else:
+            # TRTLLM_MLA_EXTRA_OVERLAP=1 reorders the V4 attention prologue so the
+            # outer compressor and the ratio-4 indexer can execute concurrently
+            # with q_b_proj + q_b_layernorm. The indexer is launched on a
+            # dedicated stream and still uses a different aux stream for its
+            # internal q-proj/weights-proj split.
+            _v4_extra_overlap = (os.environ.get("TRTLLM_MLA_EXTRA_OVERLAP", "1")
+                                 == "1" and self.compressor is not None
+                                 and self.aux_stream is not None)
+            _use_indexer_overlap = (_v4_extra_overlap and do_multi_stream()
+                                    and self.indexer is not None
+                                    and self.indexer_stream is not None)
 
-        q, kv = self.kv_a_proj_with_mqa(hidden_states).split(
-            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], -1)
+            # Pre-launch the outer compressor on compressor_stream BEFORE
+            # kv_a_proj_with_mqa. The compressor only reads hidden_states +
+            # attn_metadata, so it has no data dependency on the kv_a_proj GEMM or
+            # the downstream q_a/kv_a LN split. A dedicated stream (not aux_stream)
+            # keeps kv_a_layernorm free to run on aux_stream in parallel.
+            # _q_branch will be queued onto this same stream further down so it
+            # runs strictly serial after the compressor; dsv4_compressor_event is
+            # recorded only at the end of _q_branch, gating the caller's downstream
+            # waits on both compressor + _q_branch completion.
+            if _use_indexer_overlap:
+                self.dsv4_compressor_start_event.record()
+                with torch.cuda.stream(self.compressor_stream):
+                    self.dsv4_compressor_start_event.wait()
+                    self.compressor(hidden_states, attn_metadata)
 
-        q, kv = maybe_execute_in_parallel(
-            lambda: self.q_a_layernorm(q),
-            lambda: self.kv_a_layernorm(kv),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
-        compressed_kv, k_pe = kv.split(
-            [self.kv_lora_rank, self.qk_rope_head_dim], -1)
-        qr = q
-        latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
+            # Pre-launch the qr-independent half of the indexer prepare phase
+            # (weights_proj + internal compressor + k_cache_update) on the
+            # indexer's aux stream (self.indexer_aux_stream — wired into the
+            # indexer module as its aux_stream). Only reads hidden_states +
+            # attn_metadata, so it can overlap with the kv_a_proj → LN → split
+            # chain on the caller stream and the outer compressor on
+            # compressor_stream. The returned tuple is fed back into
+            # self.indexer() via pre_aux so the later _indexer_branch skips its
+            # own aux-stream launch.
+            _indexer_pre_aux = None
+            if _use_indexer_overlap:
+                _indexer_pre_aux = self.indexer.precompute_aux(
+                    hidden_states, attn_metadata)
 
-        # CuTe DSL path for q_b_proj (hardware-default cluster count).
-        # Restricted to DSv4 CSA layers with compress_ratio=4 so the kernel
-        # swap only kicks in where the prologue overlap is exercised — other
-        # layers keep the cuBLAS path. Set TRTLLM_MLA_Q_B_PROJ_USE_CUTE_DSL=0
-        # to disable. Bias / quantization not handled.
-        _use_q_b_cute = (self.has_dsv4_indexer and os.environ.get(
-            "TRTLLM_MLA_Q_B_PROJ_USE_CUTE_DSL", "1") == "1"
-                         and self.q_b_proj.bias is None
-                         and self.q_b_proj.weight.dtype == torch.bfloat16)
+            q, kv = self.kv_a_proj_with_mqa(hidden_states).split(
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                -1)
 
-        def _q_branch():
-            # CuTe DSL bf16 path is bench-only and intentionally bypasses the
-            # FP8-fused-quant branch (weights are bf16, so the fused FP8 path
-            # would never apply anyway — but assert to make the contract
-            # explicit and catch any future config drift).
-            if _use_q_b_cute:
-                assert not self._is_fused_q_fp8_quant_enabled(
-                    num_generations=num_generations), (
-                        "CuTe DSL q_b_proj path is incompatible with the "
-                        "fused FP8 q-quant branch")
-                q_proj = _q_b_proj_cute_dsl_bf16(q, self.q_b_proj.weight)
-                # Cross-iter cleanup: forward_absorption_* downstream gates
-                # the fused-FP8 attention path on these attrs being non-None
-                # (see _fused_quant_q_buffer/_fused_q_pe readers below). The
-                # FP8 path can't actually trigger when weights are bf16, but
-                # clear them anyway so a stale buffer from a different code
-                # path can never silently re-enable fusion.
+            q, kv = maybe_execute_in_parallel(
+                lambda: self.q_a_layernorm(q),
+                lambda: self.kv_a_layernorm(kv),
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
+            compressed_kv, k_pe = kv.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], -1)
+            qr = q
+            latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
+
+            # CuTe DSL path for q_b_proj (hardware-default cluster count).
+            # Restricted to DSv4 CSA layers with compress_ratio=4 so the kernel
+            # swap only kicks in where the prologue overlap is exercised — other
+            # layers keep the cuBLAS path. Set TRTLLM_MLA_Q_B_PROJ_USE_CUTE_DSL=0
+            # to disable. Bias / quantization not handled.
+            _use_q_b_cute = (self.has_dsv4_indexer and os.environ.get(
+                "TRTLLM_MLA_Q_B_PROJ_USE_CUTE_DSL", "1") == "1"
+                             and self.q_b_proj.bias is None
+                             and self.q_b_proj.weight.dtype == torch.bfloat16)
+
+            def _q_branch():
+                # CuTe DSL bf16 path is bench-only and intentionally bypasses the
+                # FP8-fused-quant branch (weights are bf16, so the fused FP8 path
+                # would never apply anyway — but assert to make the contract
+                # explicit and catch any future config drift).
+                if _use_q_b_cute:
+                    assert not self._is_fused_q_fp8_quant_enabled(
+                        num_generations=num_generations), (
+                            "CuTe DSL q_b_proj path is incompatible with the "
+                            "fused FP8 q-quant branch")
+                    q_proj = _q_b_proj_cute_dsl_bf16(q, self.q_b_proj.weight)
+                    # Cross-iter cleanup: forward_absorption_* downstream gates
+                    # the fused-FP8 attention path on these attrs being non-None
+                    # (see _fused_quant_q_buffer/_fused_q_pe readers below). The
+                    # FP8 path can't actually trigger when weights are bf16, but
+                    # clear them anyway so a stale buffer from a different code
+                    # path can never silently re-enable fusion.
+                    self._fused_quant_q_buffer = None
+                    self._fused_q_pe = None
+                    return self._deepseek_v4_q_b_layernorm(q_proj)
+                q_proj = self.q_b_proj(q)
+                if self._is_fused_q_fp8_quant_enabled(
+                        num_generations=num_generations):
+                    (placeholder_q, quant_q_buffer, q_pe, quant_scale_qkv
+                     ) = self._deepseek_v4_q_b_layernorm_fused_fp8(q_proj)
+                    self._fused_quant_q_buffer = quant_q_buffer
+                    self._fused_q_pe = q_pe
+                    self._quant_scale_qkv = quant_scale_qkv
+                    return placeholder_q
                 self._fused_quant_q_buffer = None
                 self._fused_q_pe = None
                 return self._deepseek_v4_q_b_layernorm(q_proj)
-            q_proj = self.q_b_proj(q)
-            if self._is_fused_q_fp8_quant_enabled(
-                    num_generations=num_generations):
-                (placeholder_q, quant_q_buffer, q_pe, quant_scale_qkv
-                 ) = self._deepseek_v4_q_b_layernorm_fused_fp8(q_proj)
-                self._fused_quant_q_buffer = quant_q_buffer
-                self._fused_q_pe = q_pe
-                self._quant_scale_qkv = quant_scale_qkv
-                return placeholder_q
-            self._fused_quant_q_buffer = None
-            self._fused_q_pe = None
-            return self._deepseek_v4_q_b_layernorm(q_proj)
 
-        def _compressor_branch():
-            self.compressor(hidden_states, attn_metadata)
-            return None
+            def _compressor_branch():
+                self.compressor(hidden_states, attn_metadata)
+                return None
 
-        def _indexer_branch():
-            return self.indexer(
+            def _indexer_branch():
+                return self.indexer(
+                    qr,
+                    hidden_states,
+                    attn_metadata,
+                    position_ids,
+                    pre_aux=_indexer_pre_aux,
+                )
+
+            topk_indices = None
+            indexer_ran = False
+            if _v4_extra_overlap:
+                if _use_indexer_overlap:
+                    # Compressor + indexer-aux are already in flight from the
+                    # pre-launch block above; the indexer-aux tail events
+                    # (weights_proj_event, k_cache_update_event) were recorded
+                    # there. The outer compressor's tail (dsv4_compressor_event)
+                    # is deferred to AFTER _q_branch so the single wait below
+                    # gates the caller on both compressor + _q_branch.
+                    self.dsv4_overlap_start_event.record()
+
+                    with torch.cuda.stream(self.indexer_stream):
+                        self.dsv4_overlap_start_event.wait()
+                        topk_indices = _indexer_branch()
+                        indexer_ran = True
+                        self.dsv4_indexer_event.record()
+
+                    # _q_branch reads qr (post-q_a_layernorm), so it must wait
+                    # for dsv4_overlap_start_event before running. Queuing it on
+                    # compressor_stream (already holding the outer compressor)
+                    # makes compressor → q_b_proj → q_b_layernorm a serial chain
+                    # on a single stream, freeing the caller stream from the
+                    # heaviest GEMM during the prologue window.
+                    with torch.cuda.stream(self.compressor_stream):
+                        self.dsv4_overlap_start_event.wait()
+                        q = _q_branch()
+                        self.dsv4_compressor_event.record()
+
+                    self.dsv4_compressor_event.wait()
+                    self.dsv4_indexer_event.wait()
+
+                    # q/topk_indices were produced on other streams; record on the
+                    # consuming stream so the caching allocator can't recycle them mid-use.
+                    cur_stream = torch.cuda.current_stream()
+                    if q is not None:
+                        q.record_stream(cur_stream)
+                    if topk_indices is not None:
+                        topk_indices.record_stream(cur_stream)
+                else:
+                    q, _ = maybe_execute_in_parallel(
+                        _q_branch,
+                        _compressor_branch,
+                        self.ln_events[0],
+                        self.ln_events[1],
+                        self.aux_stream,
+                    )
+            else:
+                q = _q_branch()
+                if self.compressor is not None:
+                    self.compressor(hidden_states, attn_metadata)
+
+        if self.indexer is not None and not indexer_ran:
+            topk_indices = self.indexer(
                 qr,
                 hidden_states,
                 attn_metadata,
                 position_ids,
                 pre_aux=_indexer_pre_aux,
             )
-
-        topk_indices = None
-        indexer_ran = False
-        if _v4_extra_overlap:
-            if _use_indexer_overlap:
-                # Compressor + indexer-aux are already in flight from the
-                # pre-launch block above; the indexer-aux tail events
-                # (weights_proj_event, k_cache_update_event) were recorded
-                # there. The outer compressor's tail (dsv4_compressor_event)
-                # is deferred to AFTER _q_branch so the single wait below
-                # gates the caller on both compressor + _q_branch.
-                self.dsv4_overlap_start_event.record()
-
-                with torch.cuda.stream(self.indexer_stream):
-                    self.dsv4_overlap_start_event.wait()
-                    topk_indices = _indexer_branch()
-                    indexer_ran = True
-                    self.dsv4_indexer_event.record()
-
-                # _q_branch reads qr (post-q_a_layernorm), so it must wait
-                # for dsv4_overlap_start_event before running. Queuing it on
-                # compressor_stream (already holding the outer compressor)
-                # makes compressor → q_b_proj → q_b_layernorm a serial chain
-                # on a single stream, freeing the caller stream from the
-                # heaviest GEMM during the prologue window.
-                with torch.cuda.stream(self.compressor_stream):
-                    self.dsv4_overlap_start_event.wait()
-                    q = _q_branch()
-                    self.dsv4_compressor_event.record()
-
-                self.dsv4_compressor_event.wait()
-                self.dsv4_indexer_event.wait()
-
-                # q/topk_indices were produced on other streams; record on the
-                # consuming stream so the caching allocator can't recycle them mid-use.
-                cur_stream = torch.cuda.current_stream()
-                if q is not None:
-                    q.record_stream(cur_stream)
-                if topk_indices is not None:
-                    topk_indices.record_stream(cur_stream)
-            else:
-                q, _ = maybe_execute_in_parallel(
-                    _q_branch,
-                    _compressor_branch,
-                    self.ln_events[0],
-                    self.ln_events[1],
-                    self.aux_stream,
-                )
-        else:
-            q = _q_branch()
-            if self.compressor is not None:
-                self.compressor(hidden_states, attn_metadata)
-
-        if self.indexer is not None:
-            if not indexer_ran:
-                topk_indices = _indexer_branch()
 
         assert q.shape[
             0] == num_tokens, f"Expect q.shape[0] to be {num_tokens}, but got {q.shape[0]}"
@@ -3586,3 +3770,14 @@ class MLA(nn.Module):
 
             self.v_b_proj, self.v_b_proj_scale = self.resmooth_parameters(
                 self.v_b_proj, self.v_b_proj_scale, recipe=(1, 128, 128))
+
+        # Build the gamma-folded fp8 q-slice weights once for the optional fused q_a path. The
+        # _dsv4_fused_qa flag already gates on the env var + is_deepseek_v4 + SM100 family, so this is
+        # a no-op otherwise. Running the one-time weight build + launcher warmup here (before CUDA-graph
+        # capture) keeps the captured forward free of one-time SETUP; the forward's remaining allocations
+        # (realigned scale buffer, deep_gemm outputs) come from the CUDA-graph private pool, so
+        # capture/replay is safe (verified by test_dsv4_fused_qa_wrapper_cuda_graph).
+        if self._dsv4_fused_qa and not self._fused_qa_built:
+            self._build_fused_qa_weights()
+            # Pre-warm the kernel launcher's one-time setup before any CUDA-graph capture.
+            self._warmup_fused_qa()
