@@ -3857,8 +3857,16 @@ class TestDeepSeekV4Pro(LlmapiAccuracyTestHarness):
     )
 
     @pytest.mark.skip_less_mpi_world_size(8)
-    def test_gsm8k_full_accuracy(self):
-        with LLM(self.MODEL_PATH, **_deepseekv4_pro_agg_llm_kwargs()) as llm:
+    def test_gsm8k_full_accuracy(self, mocker):
+        # This aggregate path captures several batch-size graphs and performs
+        # eager warmups on the same TRTLLM MoE communicator. NCCL's single-graph
+        # mode cannot safely mix those uses and may deadlock during graph warmup.
+        # Restore NCCL's graph-mixing mode before the MPI workers initialize
+        # their communicators.
+        graph_mixing_env = {"NCCL_GRAPH_MIXING_SUPPORT": "1"}
+        patch_mpi_pool_session_for_env(mocker, graph_mixing_env)
+        with mock.patch.dict(os.environ, graph_mixing_env), LLM(
+                self.MODEL_PATH, **_deepseekv4_pro_agg_llm_kwargs()) as llm:
             task = GSM8K(self.MODEL_NAME)
             acc_params = task.get_hypothesis_testing_params(
                 dtype=llm.args.dtype,
