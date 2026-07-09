@@ -18,7 +18,7 @@ Falls back to FMA when DeepGEMM is unavailable or autotuner cache misses.
 """
 
 from functools import lru_cache
-from typing import Any, List
+from typing import Any, List, Sequence
 
 import torch
 
@@ -697,28 +697,26 @@ def _fused_hc_call(
     )
 
 
-def _alloc_fused_hc_outputs(
-    B: int, n: int, hidden_size: int, num_k_splits: int, tile_m: int, device
-):
-    """Allocate outputs and workspaces with per-call storage lifetime.
+FusedHcOutputs = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+FusedHcWorkspaces = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
-    CUDA graphs retain the addresses used during capture, so these tensors
-    must be allocated inside the capture instead of borrowed from a bounded
-    process-wide cache whose eviction is unrelated to graph lifetime. Fresh
-    storage also prevents live outputs from separate mHC boundaries from
-    aliasing each other. CUDA graph replay does not execute this Python path,
-    and eager execution still benefits from PyTorch's caching allocator.
-    """
-    ws_ks = max(1, num_k_splits)
-    tm = max(1, tile_m)
-    m_batches = (B + tm - 1) // tm
+
+def _alloc_fused_hc_outputs(B: int, n: int, hidden_size: int, device) -> FusedHcOutputs:
     n2 = n * n
-    shape_n = n * (2 + n)
-
     residual_cur = torch.empty((B, n, hidden_size), dtype=torch.bfloat16, device=device)
     post_mix_cur = torch.empty((B, n), dtype=torch.float32, device=device)
     comb_mix_cur = torch.empty((B, n2), dtype=torch.float32, device=device)
     layer_input_cur = torch.empty((B, hidden_size), dtype=torch.bfloat16, device=device)
+    return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
+
+
+def _alloc_fused_hc_workspaces(
+    B: int, n: int, num_k_splits: int, tile_m: int, device
+) -> FusedHcWorkspaces:
+    ws_ks = max(1, num_k_splits)
+    tm = max(1, tile_m)
+    m_batches = (B + tm - 1) // tm
+    shape_n = n * (2 + n)
     if ws_ks == 1:
         y_acc_ws = torch.empty((B, shape_n), dtype=torch.float32, device=device)
         r_acc_ws = torch.empty((B,), dtype=torch.float32, device=device)
@@ -726,15 +724,163 @@ def _alloc_fused_hc_outputs(
         y_acc_ws = torch.empty((ws_ks, B, shape_n), dtype=torch.float32, device=device)
         r_acc_ws = torch.empty((ws_ks, B), dtype=torch.float32, device=device)
     done_counter_ws = torch.empty((m_batches,), dtype=torch.int32, device=device)
-    return (
-        residual_cur,
-        post_mix_cur,
-        comb_mix_cur,
-        layer_input_cur,
-        y_acc_ws,
-        r_acc_ws,
-        done_counter_ws,
-    )
+    return y_acc_ws, r_acc_ws, done_counter_ws
+
+
+def _round_up(value: int, alignment: int) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
+class MhcForwardBuffers:
+    """Forward-scoped storage for fused mHC boundaries.
+
+    Each boundary gets a unique slot in the first implementation. This is
+    intentionally conservative: PDL can overlap a producer with downstream
+    consumers, so reusing a ping-pong/ring slot without a proven dependency
+    bound can overwrite a live ``layer_input`` or workspace.
+
+    Outputs use two typed arenas allocated at model-forward entry. Workspace
+    dimensions depend on the selected tactic, so the first request for a
+    ``(num_k_splits, tile_m)`` pair allocates two exact-size typed arenas for
+    every slot. Different tactic shapes get separate arenas owned by this
+    object; no storage crosses model forwards or CUDA-graph captures.
+    """
+
+    _ARENA_ALIGNMENT_BYTES = 256
+
+    def __init__(
+        self,
+        *,
+        B: int,
+        n: int,
+        hidden_size: int,
+        num_slots: int,
+        device,
+        bf16_arena: torch.Tensor,
+        fp32_arena: torch.Tensor,
+    ):
+        self.B = B
+        self.n = n
+        self.hidden_size = hidden_size
+        self.num_slots = num_slots
+        self.device = torch.device(device)
+        self._bf16_arena = bf16_arena
+        self._fp32_arena = fp32_arena
+        self._workspace_arenas: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+
+    @classmethod
+    def allocate(
+        cls,
+        *,
+        B: int,
+        hidden_size: int,
+        hc_mult: int,
+        num_slots: int,
+        device,
+    ) -> "MhcForwardBuffers":
+        if B <= 0 or hidden_size <= 0 or hc_mult <= 0 or num_slots <= 0:
+            raise ValueError("mHC forward buffer dimensions and num_slots must be positive")
+
+        bf16_alignment = cls._ARENA_ALIGNMENT_BYTES // torch.bfloat16.itemsize
+        fp32_alignment = cls._ARENA_ALIGNMENT_BYTES // torch.float32.itemsize
+        bf16_slot_size = B * (hc_mult * hidden_size + hidden_size)
+        fp32_slot_size = B * (hc_mult + hc_mult * hc_mult)
+        bf16_slot_stride = _round_up(bf16_slot_size, bf16_alignment)
+        fp32_slot_stride = _round_up(fp32_slot_size, fp32_alignment)
+
+        bf16_arena = torch.empty((num_slots, bf16_slot_stride), dtype=torch.bfloat16, device=device)
+        fp32_arena = torch.empty((num_slots, fp32_slot_stride), dtype=torch.float32, device=device)
+        return cls(
+            B=B,
+            n=hc_mult,
+            hidden_size=hidden_size,
+            num_slots=num_slots,
+            device=device,
+            bf16_arena=bf16_arena,
+            fp32_arena=fp32_arena,
+        )
+
+    def _check_slot(self, slot: int) -> None:
+        if not 0 <= slot < self.num_slots:
+            raise IndexError(f"mHC buffer slot {slot} is outside [0, {self.num_slots})")
+
+    def outputs(self, slot: int) -> FusedHcOutputs:
+        self._check_slot(slot)
+        B, n, hidden_size = self.B, self.n, self.hidden_size
+
+        bf16_slot = self._bf16_arena[slot]
+        residual_numel = B * n * hidden_size
+        residual_cur = bf16_slot[:residual_numel].view(B, n, hidden_size)
+        layer_input_cur = bf16_slot[residual_numel : residual_numel + B * hidden_size].view(
+            B, hidden_size
+        )
+
+        fp32_slot = self._fp32_arena[slot]
+        post_mix_numel = B * n
+        post_mix_cur = fp32_slot[:post_mix_numel].view(B, n)
+        comb_mix_cur = fp32_slot[post_mix_numel : post_mix_numel + B * n * n].view(B, n * n)
+        return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
+
+    def workspaces(self, slot: int, *, num_k_splits: int, tile_m: int) -> FusedHcWorkspaces:
+        self._check_slot(slot)
+        ws_ks = max(1, num_k_splits)
+        tm = max(1, tile_m)
+        key = (ws_ks, tm)
+        arenas = self._workspace_arenas.get(key)
+        if arenas is None:
+            fp32_alignment = self._ARENA_ALIGNMENT_BYTES // torch.float32.itemsize
+            int32_alignment = self._ARENA_ALIGNMENT_BYTES // torch.int32.itemsize
+            shape_n = self.n * (2 + self.n)
+            fp32_slot_size = ws_ks * self.B * (shape_n + 1)
+            int32_slot_size = (self.B + tm - 1) // tm
+            fp32_slot_stride = _round_up(fp32_slot_size, fp32_alignment)
+            int32_slot_stride = _round_up(int32_slot_size, int32_alignment)
+            arenas = (
+                torch.empty(
+                    (self.num_slots, fp32_slot_stride),
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+                torch.empty(
+                    (self.num_slots, int32_slot_stride),
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+            )
+            self._workspace_arenas[key] = arenas
+
+        fp32_arena, int32_arena = arenas
+        shape_n = self.n * (2 + self.n)
+        y_numel = ws_ks * self.B * shape_n
+        fp32_slot = fp32_arena[slot]
+        if ws_ks == 1:
+            y_acc_ws = fp32_slot[:y_numel].view(self.B, shape_n)
+            r_acc_ws = fp32_slot[y_numel : y_numel + self.B].view(self.B)
+        else:
+            y_acc_ws = fp32_slot[:y_numel].view(ws_ks, self.B, shape_n)
+            r_acc_ws = fp32_slot[y_numel : y_numel + ws_ks * self.B].view(ws_ks, self.B)
+        m_batches = (self.B + tm - 1) // tm
+        done_counter_ws = int32_arena[slot, :m_batches]
+        return y_acc_ws, r_acc_ws, done_counter_ws
+
+
+def _validate_fused_hc_tensors(
+    tensors: Sequence[torch.Tensor],
+    specs: Sequence[tuple[tuple[int, ...], torch.dtype]],
+    *,
+    device: torch.device,
+    name: str,
+) -> None:
+    if len(tensors) != len(specs):
+        raise ValueError(f"{name} must contain {len(specs)} tensors, got {len(tensors)}")
+    for idx, (tensor, (shape, dtype)) in enumerate(zip(tensors, specs)):
+        if tensor.shape != shape or tensor.dtype != dtype or tensor.device != device:
+            raise ValueError(
+                f"{name}[{idx}] must have shape={shape}, dtype={dtype}, device={device}; "
+                f"got shape={tuple(tensor.shape)}, dtype={tensor.dtype}, device={tensor.device}"
+            )
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name}[{idx}] must be contiguous")
 
 
 # Fallback tactic: backend, tile_n, num_k_splits, bigfuse_bs, tile_m.
@@ -867,7 +1013,15 @@ class MhcFusedHcRunner(TunableRunner):
 
         return tactics
 
-    def forward(self, inputs, *, tactic=-1, **kwargs):
+    def forward(
+        self,
+        inputs,
+        *,
+        tactic=-1,
+        outputs: FusedHcOutputs | None = None,
+        workspaces: FusedHcWorkspaces | None = None,
+        **kwargs,
+    ):
         (
             x_prev,
             residual_prev,
@@ -903,17 +1057,42 @@ class MhcFusedHcRunner(TunableRunner):
             norm_weight = norm_weight.contiguous()
 
         B = residual_prev.shape[0]
-        (
-            residual_cur,
-            post_mix_cur,
-            comb_mix_cur,
-            layer_input_cur,
-            y_acc_ws,
-            r_acc_ws,
-            done_counter_ws,
-        ) = _alloc_fused_hc_outputs(
-            B, self.n, self.hidden_size, num_k_splits, tile_m, x_prev.device
-        )
+        if outputs is None:
+            outputs = _alloc_fused_hc_outputs(B, self.n, self.hidden_size, x_prev.device)
+        else:
+            _validate_fused_hc_tensors(
+                outputs,
+                (
+                    ((B, self.n, self.hidden_size), torch.bfloat16),
+                    ((B, self.n), torch.float32),
+                    ((B, self.n * self.n), torch.float32),
+                    ((B, self.hidden_size), torch.bfloat16),
+                ),
+                device=x_prev.device,
+                name="outputs",
+            )
+        if workspaces is None:
+            workspaces = _alloc_fused_hc_workspaces(B, self.n, num_k_splits, tile_m, x_prev.device)
+        else:
+            ws_ks = max(1, num_k_splits)
+            tm = max(1, tile_m)
+            m_batches = (B + tm - 1) // tm
+            shape_n = self.n * (2 + self.n)
+            y_shape = (B, shape_n) if ws_ks == 1 else (ws_ks, B, shape_n)
+            r_shape = (B,) if ws_ks == 1 else (ws_ks, B)
+            _validate_fused_hc_tensors(
+                workspaces,
+                (
+                    (y_shape, torch.float32),
+                    (r_shape, torch.float32),
+                    ((m_batches,), torch.int32),
+                ),
+                device=x_prev.device,
+                name="workspaces",
+            )
+
+        residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur = outputs
+        y_acc_ws, r_acc_ws, done_counter_ws = workspaces
 
         _fused_hc_call(
             backend_code,
@@ -1006,6 +1185,8 @@ def mhc_fused_hc(
     sinkhorn_repeat: int,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 0.0,
+    forward_buffers: MhcForwardBuffers | None = None,
+    buffer_slot: int | None = None,
 ):
     """Fuse the previous block's post_mapping with the current block's pre_mapping.
 
@@ -1050,6 +1231,25 @@ def mhc_fused_hc(
         norm_eps=norm_eps,
     )
 
+    outputs = None
+    workspaces = None
+    if forward_buffers is not None:
+        if buffer_slot is None:
+            raise ValueError("buffer_slot is required when forward_buffers is provided")
+        if forward_buffers.B != residual_prev.shape[0]:
+            raise ValueError(
+                f"forward buffer batch size {forward_buffers.B} does not match "
+                f"fused_hc batch size {residual_prev.shape[0]}"
+            )
+        if forward_buffers.n != n or forward_buffers.hidden_size != hidden_size:
+            raise ValueError("forward buffer mHC dimensions do not match fused_hc")
+        tactic = _get_fused_hc_fallback_tactic(hidden_size) if best_tactic == -1 else best_tactic
+        _, _, num_k_splits, _, tile_m = tactic
+        outputs = forward_buffers.outputs(buffer_slot)
+        workspaces = forward_buffers.workspaces(
+            buffer_slot, num_k_splits=num_k_splits, tile_m=tile_m
+        )
+
     return runner(
         inputs=[
             x_prev,
@@ -1063,6 +1263,8 @@ def mhc_fused_hc(
         tactic=best_tactic,
         norm_weight=norm_weight,
         norm_eps=norm_eps,
+        outputs=outputs,
+        workspaces=workspaces,
     )
 
 

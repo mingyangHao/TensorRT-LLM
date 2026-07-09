@@ -577,6 +577,159 @@ def test_mhc_fused_hc_outputs_do_not_alias_across_calls(monkeypatch):
         )
 
 
+def test_mhc_forward_buffers_use_disjoint_aligned_slots():
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcForwardBuffers
+
+    buffers = MhcForwardBuffers.allocate(
+        B=3,
+        hidden_size=8,
+        hc_mult=4,
+        num_slots=3,
+        device="cpu",
+    )
+
+    outputs = [buffers.outputs(slot) for slot in range(3)]
+    workspaces = [buffers.workspaces(slot, num_k_splits=2, tile_m=2) for slot in range(3)]
+
+    # Views of the same dtype share one forward-owned arena, while every
+    # boundary slot starts at disjoint, 256-byte-strided storage.
+    assert outputs[0][0].untyped_storage().data_ptr() == outputs[1][3].untyped_storage().data_ptr()
+    assert outputs[0][1].untyped_storage().data_ptr() == outputs[2][2].untyped_storage().data_ptr()
+    for tensor_idx in range(4):
+        ptrs = [slot[tensor_idx].data_ptr() for slot in outputs]
+        assert len(set(ptrs)) == len(ptrs)
+        assert all((ptr - ptrs[0]) % 256 == 0 for ptr in ptrs[1:])
+
+    assert (
+        workspaces[0][0].untyped_storage().data_ptr()
+        == workspaces[2][1].untyped_storage().data_ptr()
+    )
+    for tensor_idx in range(3):
+        ptrs = [slot[tensor_idx].data_ptr() for slot in workspaces]
+        assert len(set(ptrs)) == len(ptrs)
+        assert all((ptr - ptrs[0]) % 256 == 0 for ptr in ptrs[1:])
+
+
+def test_mhc_fused_hc_runner_uses_forward_owned_buffers(monkeypatch):
+    """Explicit buffers must reach the kernel without hidden allocations."""
+    from tensorrt_llm._torch.modules.mhc import mhc_cuda
+
+    batch_size = 2
+    hc_mult = 4
+    hidden_size = 8
+    runner = mhc_cuda.MhcFusedHcRunner(
+        n=hc_mult,
+        hidden_size=hidden_size,
+        rms_eps=1e-6,
+        hc_pre_eps=1e-6,
+        hc_sinkhorn_eps=1e-6,
+        hc_post_mult_value=1.0,
+        sinkhorn_repeat=2,
+    )
+    inputs = [
+        torch.empty((batch_size, hidden_size), dtype=torch.bfloat16),
+        torch.empty((batch_size, hc_mult, hidden_size), dtype=torch.bfloat16),
+        torch.empty((batch_size, hc_mult), dtype=torch.float32),
+        torch.empty((batch_size, hc_mult, hc_mult), dtype=torch.float32),
+        torch.empty((hc_mult * (2 + hc_mult), hc_mult * hidden_size), dtype=torch.float32),
+        torch.empty((3,), dtype=torch.float32),
+        torch.empty((hc_mult * (2 + hc_mult),), dtype=torch.float32),
+    ]
+    tactic = ("fused_half_fma", 2, 2, 256, 1)
+    buffers = mhc_cuda.MhcForwardBuffers.allocate(
+        B=batch_size,
+        hidden_size=hidden_size,
+        hc_mult=hc_mult,
+        num_slots=2,
+        device="cpu",
+    )
+    outputs = buffers.outputs(1)
+    workspaces = buffers.workspaces(1, num_k_splits=tactic[2], tile_m=tactic[4])
+    kernel_args = {}
+
+    def fake_fused_hc_call(*args, **kwargs):
+        kernel_args["args"] = args
+
+    def fail_alloc(*args, **kwargs):
+        raise AssertionError("runner performed a hidden allocation")
+
+    monkeypatch.setattr(mhc_cuda, "_fused_hc_call", fake_fused_hc_call)
+    monkeypatch.setattr(mhc_cuda, "_alloc_fused_hc_outputs", fail_alloc)
+    monkeypatch.setattr(mhc_cuda, "_alloc_fused_hc_workspaces", fail_alloc)
+
+    actual = runner(
+        inputs=inputs,
+        tactic=tactic,
+        outputs=outputs,
+        workspaces=workspaces,
+    )
+
+    assert tuple(t.data_ptr() for t in actual) == tuple(t.data_ptr() for t in outputs)
+    assert tuple(t.data_ptr() for t in kernel_args["args"][12:16]) == tuple(
+        t.data_ptr() for t in outputs
+    )
+    assert tuple(t.data_ptr() for t in kernel_args["args"][16:19]) == tuple(
+        t.data_ptr() for t in workspaces
+    )
+
+
+def test_mhc_fused_hc_routes_selected_tactic_to_forward_buffer_slot(monkeypatch):
+    from tensorrt_llm._torch.modules.mhc import mhc_cuda
+
+    batch_size = 2
+    hc_mult = 4
+    hidden_size = 8
+    tactic = ("fused_half_fma", 2, 2, 256, 1)
+    buffers = mhc_cuda.MhcForwardBuffers.allocate(
+        B=batch_size,
+        hidden_size=hidden_size,
+        hc_mult=hc_mult,
+        num_slots=2,
+        device="cpu",
+    )
+    call = {}
+
+    class FakeRunner:
+        def __call__(self, **kwargs):
+            call.update(kwargs)
+            return kwargs["outputs"]
+
+    class FakeTuner:
+        def choose_one(self, *args, **kwargs):
+            return FakeRunner(), tactic
+
+    runner = FakeRunner()
+    monkeypatch.setattr(mhc_cuda, "_get_fused_hc_runner", lambda **kwargs: runner)
+    monkeypatch.setattr(mhc_cuda.AutoTuner, "get", lambda: FakeTuner())
+
+    output = mhc_cuda.mhc_fused_hc(
+        x_prev=torch.empty((batch_size, hidden_size), dtype=torch.bfloat16),
+        residual_prev=torch.empty((batch_size, hc_mult, hidden_size), dtype=torch.bfloat16),
+        post_mix_prev=torch.empty((batch_size, hc_mult), dtype=torch.float32),
+        comb_mix_prev=torch.empty((batch_size, hc_mult, hc_mult), dtype=torch.float32),
+        w_t_cur=torch.empty((hc_mult * (2 + hc_mult), hc_mult * hidden_size), dtype=torch.float32),
+        hc_scale_cur=torch.empty((3,), dtype=torch.float32),
+        hc_base_cur=torch.empty((hc_mult * (2 + hc_mult),), dtype=torch.float32),
+        n=hc_mult,
+        hidden_size=hidden_size,
+        rms_eps=1e-6,
+        hc_pre_eps=1e-6,
+        hc_sinkhorn_eps=1e-6,
+        hc_post_mult_value=1.0,
+        sinkhorn_repeat=2,
+        forward_buffers=buffers,
+        buffer_slot=1,
+    )
+
+    expected_outputs = buffers.outputs(1)
+    expected_workspaces = buffers.workspaces(1, num_k_splits=tactic[2], tile_m=tactic[4])
+    assert tuple(t.data_ptr() for t in output) == tuple(t.data_ptr() for t in expected_outputs)
+    assert call["tactic"] == tactic
+    assert tuple(t.data_ptr() for t in call["workspaces"]) == tuple(
+        t.data_ptr() for t in expected_workspaces
+    )
+
+
 def test_mhc_fused_hc_mma_tactic_filter_hidden_sizes():
     from tensorrt_llm._torch.modules.mhc.mhc_cuda import (
         _FUSED_HC_HALF_MMA_KS,
@@ -945,7 +1098,7 @@ def test_mhc_fused_hc_cuda_graph(n: int, hidden_size: int, hc_mult: int):
     for the autotuner fallback — atomics active, not deterministic across
     replays).
     """
-    from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcFusedHcRunner
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcForwardBuffers, MhcFusedHcRunner
 
     if not _mhc_fused_hc_mma_available():
         pytest.skip("mHC fused-HC MMA kernels require SM100 and BUILD_DEEP_GEMM=ON")
@@ -999,10 +1152,28 @@ def test_mhc_fused_hc_cuda_graph(n: int, hidden_size: int, hc_mult: int):
             cur_module.base,
         ]
 
+    def _buffers():
+        return MhcForwardBuffers.allocate(
+            B=n,
+            hidden_size=hidden_size,
+            hc_mult=hc_mult,
+            num_slots=1,
+            device=device,
+        )
+
+    def _run(buffers):
+        return runner(
+            inputs=_inputs(),
+            tactic=tactic,
+            outputs=buffers.outputs(0),
+            workspaces=buffers.workspaces(0, num_k_splits=tactic[2], tile_m=tactic[4]),
+        )
+
     # Eager reference. Keep the raw outputs alive through capture so the test
     # can verify that graph intermediates receive independent, graph-owned
     # storage instead of borrowing an eager allocation from a shape cache.
-    eager_raw = runner(inputs=_inputs(), tactic=tactic)
+    eager_buffers = _buffers()
+    eager_raw = _run(eager_buffers)
     eager_ptrs = tuple(t.data_ptr() for t in eager_raw)
     eager_out = tuple(t.clone() for t in eager_raw)
 
@@ -1011,14 +1182,15 @@ def test_mhc_fused_hc_cuda_graph(n: int, hidden_size: int, hc_mult: int):
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         for _ in range(3):
-            runner(inputs=_inputs(), tactic=tactic)
+            _run(_buffers())
     torch.cuda.current_stream().wait_stream(s)
     torch.cuda.synchronize()
 
     # Capture.
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        graph_out = runner(inputs=_inputs(), tactic=tactic)
+        graph_buffers = _buffers()
+        graph_out = _run(graph_buffers)
 
     for graph_tensor, eager_ptr, name in zip(
         graph_out, eager_ptrs, ["residual", "post_mix", "comb_mix", "layer_input"]
@@ -1046,7 +1218,7 @@ def test_mhc_fused_hc_cuda_graph(n: int, hidden_size: int, hc_mult: int):
     residual_prev.mul_(1.001)
     post_mix_prev.mul_(1.001)
     comb_mix_prev.mul_(1.001)
-    eager_raw2 = runner(inputs=_inputs(), tactic=tactic)
+    eager_raw2 = _run(_buffers())
     eager_out2 = tuple(t.clone() for t in eager_raw2)
     g.replay()
     torch.cuda.synchronize()

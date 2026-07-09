@@ -77,6 +77,7 @@ from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.mhc.hyper_connection import HCHead, HCState, mHC
+from ..modules.mhc.mhc_cuda import MhcForwardBuffers
 from ..modules.mla import MLA
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
@@ -1906,6 +1907,8 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         input_ids: Optional[torch.IntTensor] = None,
         engram_embeddings=None,
+        mhc_buffers: Optional[MhcForwardBuffers] = None,
+        mhc_slot: int = 0,
         **kwargs,
     ):
         """mHC-aware decoder layer with boundary fusion.
@@ -1941,7 +1944,11 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         # as a standalone RMSNorm on the layer-0 / engram / non-deferred path.
         # -------------------------------------------------------------------
         residual, post_mix, comb_mix, layer_input = self._entry_boundary(
-            hc_state, engram_embeddings, has_engram
+            hc_state,
+            engram_embeddings,
+            has_engram,
+            mhc_buffers=mhc_buffers,
+            mhc_slot=mhc_slot,
         )
 
         # -------------------------------------------------------------------
@@ -1968,6 +1975,8 @@ class DeepseekV4DecoderLayer(DecoderLayer):
                 residual_prev=residual,
                 post_mix_prev=post_mix,
                 comb_mix_prev=comb_mix,
+                forward_buffers=mhc_buffers,
+                buffer_slot=mhc_slot + 1,
             )
         else:
             # Break fused_hc into post_mapping and pre_mapping as separate ops.
@@ -2005,7 +2014,15 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         )
         return HCState.resolved(resolved_residual)
 
-    def _entry_boundary(self, hc_state, engram_embeddings, has_engram):
+    def _entry_boundary(
+        self,
+        hc_state,
+        engram_embeddings,
+        has_engram,
+        *,
+        mhc_buffers: Optional[MhcForwardBuffers] = None,
+        mhc_slot: int = 0,
+    ):
         """Resolve the per-layer entry into (residual, post_mix, comb_mix, layer_input).
 
         Two code paths:
@@ -2031,6 +2048,8 @@ class DeepseekV4DecoderLayer(DecoderLayer):
                 comb_mix_prev=hc_state.comb_mix,
                 norm_weight=self.input_layernorm.weight,
                 norm_eps=self.input_layernorm.variance_epsilon,
+                forward_buffers=mhc_buffers,
+                buffer_slot=mhc_slot,
             )
 
         # Unfused entry: layer 0 hands us the initial residual tensor
@@ -2256,6 +2275,16 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
         hidden_states = self.h_proj(hidden_states)
         hidden_states = inputs_embeds + hidden_states
 
+        mhc_buffers = None
+        if self.enable_fused_hc:
+            mhc_buffers = MhcForwardBuffers.allocate(
+                B=hidden_states.shape[0],
+                hidden_size=self.hidden_dim,
+                hc_mult=self.hc_mult,
+                num_slots=2,
+                device=hidden_states.device,
+            )
+
         original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
         if all_rank_num_tokens is not None:
             attn_metadata.all_rank_num_tokens = all_rank_num_tokens
@@ -2266,6 +2295,8 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
                 attn_metadata=attn_metadata,
                 spec_metadata=spec_metadata,
                 input_ids=input_ids,
+                mhc_buffers=mhc_buffers,
+                mhc_slot=0,
                 **kwargs,
             )
         finally:
@@ -2427,7 +2458,21 @@ class DeepseekV4Model(DecoderModel):
         # a standalone hc_post; a resolved state feeds hc_head directly.
         hc_state = hidden_states
 
-        for idx, decoder_layer in enumerate(self.layers[: self.num_hidden_layers]):
+        mhc_buffers = None
+        decoder_layers = self.layers[: self.num_hidden_layers]
+        if any(getattr(layer, "enable_fused_hc", False) for layer in decoder_layers):
+            # Use one unique slot for each possible entry/mid-layer boundary.
+            # This deliberately avoids same-forward reuse until the maximum
+            # PDL overlap depth has been measured and bounded.
+            mhc_buffers = MhcForwardBuffers.allocate(
+                B=hidden_states.shape[0],
+                hidden_size=hidden_states.shape[-1],
+                hc_mult=self.hc_mult,
+                num_slots=2 * len(decoder_layers),
+                device=hidden_states.device,
+            )
+
+        for idx, decoder_layer in enumerate(decoder_layers):
             engram_embeddings = None
             if engram_embeddings_cache is not None and idx in engram_embeddings_cache:
                 # Sync: ensure the engram stream has finished precompute for this layer
@@ -2442,6 +2487,8 @@ class DeepseekV4Model(DecoderModel):
                 spec_metadata=spec_metadata,
                 input_ids=input_ids,
                 engram_embeddings=engram_embeddings,
+                mhc_buffers=mhc_buffers,
+                mhc_slot=2 * idx,
             )
 
         hidden_states = hc_state.residual.flatten(1)

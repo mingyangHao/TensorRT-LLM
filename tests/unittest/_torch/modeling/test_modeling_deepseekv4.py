@@ -5,6 +5,7 @@ import struct
 import textwrap
 import weakref
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -30,6 +31,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
     DeepseekV4Gate,
+    DeepseekV4Model,
     DeepseekV4MTP,
     _copy_deepseek_v4_fused_a_weight_scale,
     _deepseek_v4_pos_embd_params,
@@ -37,6 +39,8 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     _resolve_enable_fused_hc,
 )
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
+from tensorrt_llm._torch.modules.mhc.hyper_connection import HCState
+from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcForwardBuffers
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import AuxStreamType, model_extra_attrs
@@ -161,6 +165,40 @@ def test_deepseek_v4_model_defaults():
             "enable_swa_scratch_reuse": True,
         }
     }
+
+
+def test_deepseek_v4_model_forward_owns_mhc_boundary_buffers():
+    calls = []
+
+    class FakeDecoderLayer(torch.nn.Module):
+        enable_fused_hc = True
+
+        def forward(self, *, hc_state, mhc_buffers, mhc_slot, **kwargs):
+            calls.append((mhc_buffers, mhc_slot))
+            residual = hc_state if isinstance(hc_state, torch.Tensor) else hc_state.residual
+            return HCState.resolved(residual)
+
+    model = object.__new__(DeepseekV4Model)
+    torch.nn.Module.__init__(model)
+    model.num_hidden_layers = 3
+    model.hc_mult = 4
+    model.layers = torch.nn.ModuleList([FakeDecoderLayer() for _ in range(3)])
+    model.use_engram = False
+    model.engram_hash_provider = None
+    model.model_config = SimpleNamespace(mapping=SimpleNamespace(has_pp=lambda: False))
+
+    inputs_embeds = torch.empty((2, 8), dtype=torch.bfloat16)
+    output = DeepseekV4Model.forward(
+        model,
+        attn_metadata=object(),
+        inputs_embeds=inputs_embeds,
+    )
+
+    assert output.shape == (2, 32)
+    assert [slot for _, slot in calls] == [0, 2, 4]
+    assert all(owner is calls[0][0] for owner, _ in calls)
+    assert isinstance(calls[0][0], MhcForwardBuffers)
+    assert calls[0][0].num_slots == 6
 
 
 def test_deepseek_v4_weight_remap_for_mxfp4_routed_experts():

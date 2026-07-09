@@ -4,10 +4,13 @@
 # Multi-Head Hyper-Connection (mHC) module
 # Based on: "Hyper-Connections" (https://arxiv.org/abs/2409.19606)
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from torch import nn
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcForwardBuffers
 
 
 @dataclass
@@ -146,6 +149,8 @@ class mHC(nn.Module):
         comb_mix_prev: torch.Tensor,
         norm_weight: Optional[torch.Tensor] = None,
         norm_eps: float = 0.0,
+        forward_buffers: Optional["MhcForwardBuffers"] = None,
+        buffer_slot: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Fused post_mapping(from previous mHC) + pre_mapping(from self).
 
@@ -173,6 +178,8 @@ class mHC(nn.Module):
             norm_weight:   [hidden] bf16 / None — when set, fuse next-layer RMSNorm
                            into ``layer_input_cur`` epilogue.
             norm_eps:      RMSNorm epsilon (only consulted when ``norm_weight`` is set).
+            forward_buffers: Optional model-forward-owned output/workspace arenas.
+            buffer_slot:   Unique boundary slot within ``forward_buffers``.
 
         Returns:
             residual_cur:    [..., mult, hidden] bf16 (new residual for next post_mapping)
@@ -214,6 +221,8 @@ class mHC(nn.Module):
             self.sinkhorn_iters,
             norm_weight=norm_weight,
             norm_eps=norm_eps,
+            forward_buffers=forward_buffers,
+            buffer_slot=buffer_slot,
         )
 
         residual_cur = residual_cur.view(*outer_shape, n, hidden)
