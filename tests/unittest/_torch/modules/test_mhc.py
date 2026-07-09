@@ -532,6 +532,51 @@ _BACKEND_TACTICS_BY_M = {
 }
 
 
+def test_mhc_fused_hc_outputs_do_not_alias_across_calls(monkeypatch):
+    """Returned buffers must remain live until their callers release them.
+
+    A shape-keyed cache cannot safely return the same storage from two calls:
+    the first call's outputs may still be consumed by later layers or captured
+    by a CUDA graph when the second call starts writing its outputs.
+    """
+    from tensorrt_llm._torch.modules.mhc import mhc_cuda
+
+    monkeypatch.setattr(mhc_cuda, "_fused_hc_call", lambda *args, **kwargs: None)
+
+    batch_size = 2
+    hc_mult = 4
+    hidden_size = 8
+    runner = mhc_cuda.MhcFusedHcRunner(
+        n=hc_mult,
+        hidden_size=hidden_size,
+        rms_eps=1e-6,
+        hc_pre_eps=1e-6,
+        hc_sinkhorn_eps=1e-6,
+        hc_post_mult_value=1.0,
+        sinkhorn_repeat=2,
+    )
+    inputs = [
+        torch.empty((batch_size, hidden_size), dtype=torch.bfloat16),
+        torch.empty((batch_size, hc_mult, hidden_size), dtype=torch.bfloat16),
+        torch.empty((batch_size, hc_mult), dtype=torch.float32),
+        torch.empty((batch_size, hc_mult, hc_mult), dtype=torch.float32),
+        torch.empty((hc_mult * (2 + hc_mult), hc_mult * hidden_size), dtype=torch.float32),
+        torch.empty((3,), dtype=torch.float32),
+        torch.empty((hc_mult * (2 + hc_mult),), dtype=torch.float32),
+    ]
+    tactic = ("fused_half_fma", 2, 1, 256, 1)
+
+    first = runner(inputs=inputs, tactic=tactic)
+    second = runner(inputs=inputs, tactic=tactic)
+
+    for first_tensor, second_tensor, name in zip(
+        first, second, ("residual", "post_mix", "comb_mix", "layer_input")
+    ):
+        assert first_tensor.data_ptr() != second_tensor.data_ptr(), (
+            f"fused_hc reused live {name} storage across calls"
+        )
+
+
 def test_mhc_fused_hc_mma_tactic_filter_hidden_sizes():
     from tensorrt_llm._torch.modules.mhc.mhc_cuda import (
         _FUSED_HC_HALF_MMA_KS,
@@ -954,11 +999,11 @@ def test_mhc_fused_hc_cuda_graph(n: int, hidden_size: int, hc_mult: int):
             cur_module.base,
         ]
 
-    # Eager reference — runner's workspace cache reuses output tensors across
-    # calls with matching shape, so eager_out and graph_out alias the same
-    # storage. Clone eager_out so we can compare after the graph replay
-    # overwrites the workspace.
+    # Eager reference. Keep the raw outputs alive through capture so the test
+    # can verify that graph intermediates receive independent, graph-owned
+    # storage instead of borrowing an eager allocation from a shape cache.
     eager_raw = runner(inputs=_inputs(), tactic=tactic)
+    eager_ptrs = tuple(t.data_ptr() for t in eager_raw)
     eager_out = tuple(t.clone() for t in eager_raw)
 
     # Warm up on a side stream — required for CUDA graph capture.
@@ -974,6 +1019,13 @@ def test_mhc_fused_hc_cuda_graph(n: int, hidden_size: int, hc_mult: int):
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         graph_out = runner(inputs=_inputs(), tactic=tactic)
+
+    for graph_tensor, eager_ptr, name in zip(
+        graph_out, eager_ptrs, ["residual", "post_mix", "comb_mix", "layer_input"]
+    ):
+        assert graph_tensor.data_ptr() != eager_ptr, (
+            f"CUDA graph captured eager-owned fused_hc {name} storage"
+        )
 
     # Replay — outputs should update in place.
     g.replay()
