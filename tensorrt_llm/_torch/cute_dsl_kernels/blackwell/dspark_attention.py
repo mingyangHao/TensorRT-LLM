@@ -18,12 +18,11 @@ except ImportError:
 
 
 class DSparkAttentionKernel:
-    """One-CTA-per-query fused MQA attention with an attention sink."""
+    """Warp-per-head fused MQA attention with an attention sink."""
 
     # A single warp owns one (request, query, head). Each lane keeps 16
     # dimensions of a production 512-wide head in registers, avoiding a
     # shared-memory reduction and two CTA barriers per attended token.
-    num_threads = cute.arch.WARP_SIZE
     log2_e = 1.4426950408889634
 
     def __init__(
@@ -33,18 +32,33 @@ class DSparkAttentionKernel:
         num_heads: int,
         head_dim: int,
         softmax_scale: float,
+        warps_per_cta: int = 1,
+        dynamic_context_loop: bool = False,
     ):
-        if head_dim % self.num_threads != 0:
+        if warps_per_cta not in (1, 2, 4, 8):
             raise ValueError(
-                f"DSparkAttentionKernel head_dim must be divisible by {self.num_threads}; "
+                "DSparkAttentionKernel warps_per_cta must be one of 1, 2, 4, or 8; "
+                f"got {warps_per_cta}"
+            )
+        if num_heads % warps_per_cta != 0:
+            raise ValueError(
+                "DSparkAttentionKernel num_heads must be divisible by warps_per_cta; "
+                f"got num_heads={num_heads}, warps_per_cta={warps_per_cta}"
+            )
+        if head_dim % cute.arch.WARP_SIZE != 0:
+            raise ValueError(
+                f"DSparkAttentionKernel head_dim must be divisible by {cute.arch.WARP_SIZE}; "
                 f"got {head_dim}"
             )
         self.window_size = window_size
         self.block_size = block_size
         self.num_heads = num_heads
         self.head_dim = head_dim
-        self.elements_per_thread = head_dim // self.num_threads
+        self.warps_per_cta = warps_per_cta
+        self.num_threads = cute.arch.WARP_SIZE * warps_per_cta
+        self.elements_per_thread = head_dim // cute.arch.WARP_SIZE
         self.softmax_scale = softmax_scale
+        self.dynamic_context_loop = dynamic_context_loop
 
     @cute.jit
     def __call__(
@@ -60,7 +74,7 @@ class DSparkAttentionKernel:
         stream: cuda.CUstream,
     ):
         self.kernel(q, main_kv, block_kv, kv_cache, slots, start_pos, attn_sink, output).launch(
-            grid=[q.shape[0], self.block_size, self.num_heads],
+            grid=[q.shape[0], self.block_size, self.num_heads // self.warps_per_cta],
             block=[self.num_threads, 1, 1],
             stream=stream,
         )
@@ -81,8 +95,17 @@ class DSparkAttentionKernel:
         attn_sink: cute.Tensor,
         output: cute.Tensor,
     ):
-        tidx, _, _ = cute.arch.thread_idx()
-        request_idx, query_idx, head_idx = cute.arch.block_idx()
+        request_idx, query_idx, head_group_idx = cute.arch.block_idx()
+        if cutlass.const_expr(self.warps_per_cta == 1):
+            # Keep the current PR's one-warp launch/index path as the exact A/B
+            # baseline, including its generated instruction sequence.
+            lane_idx, _, _ = cute.arch.thread_idx()
+            warp_idx = cutlass.Int32(0)
+            head_idx = head_group_idx
+        else:
+            lane_idx = cute.arch.lane_idx()
+            warp_idx = cute.arch.warp_idx()
+            head_idx = head_group_idx * self.warps_per_cta + warp_idx
 
         slot = cutlass.Int32(slots[request_idx])
         position = cutlass.Int32(start_pos[request_idx])
@@ -91,15 +114,15 @@ class DSparkAttentionKernel:
         # Exactly one CTA persists the captured-context KV. Attention CTAs read
         # main_kv directly for write_pos, so no inter-CTA synchronization is
         # needed before the newly written row becomes visible on the next step.
-        if query_idx == 0 and head_idx == 0:
+        if query_idx == 0 and head_group_idx == 0 and warp_idx == 0:
             for item in cutlass.range_constexpr(self.elements_per_thread):
-                dim = tidx + item * self.num_threads
+                dim = lane_idx + item * cute.arch.WARP_SIZE
                 kv_cache[slot, write_pos, dim] = main_kv[request_idx, dim]
 
         q_values = cute.make_rmem_tensor((self.elements_per_thread,), cutlass.Float32)
         accum = cute.make_rmem_tensor((self.elements_per_thread,), cutlass.Float32)
         for item in cutlass.range_constexpr(self.elements_per_thread):
-            dim = tidx + item * self.num_threads
+            dim = lane_idx + item * cute.arch.WARP_SIZE
             q_values[item] = cutlass.Float32(q[request_idx, query_idx, head_idx, dim])
             accum[item] = cutlass.Float32(0.0)
 
@@ -108,12 +131,20 @@ class DSparkAttentionKernel:
 
         # Physical cache order is irrelevant to attention. Before the window
         # fills, slot c is valid iff c <= start_pos; once full all rows are valid.
-        for context_idx in cutlass.range(self.window_size, unroll=1):
-            if context_idx <= position:
+        context_rows = self.window_size
+        if cutlass.const_expr(self.dynamic_context_loop):
+            context_rows = position + 1
+            if context_rows > self.window_size:
+                context_rows = self.window_size
+        for context_idx in cutlass.range(context_rows, unroll=1):
+            is_valid = context_idx <= position
+            if cutlass.const_expr(self.dynamic_context_loop):
+                is_valid = True
+            if is_valid:
                 partial = cutlass.Float32(0.0)
                 values = cute.make_rmem_tensor((self.elements_per_thread,), cutlass.Float32)
                 for item in cutlass.range_constexpr(self.elements_per_thread):
-                    dim = tidx + item * self.num_threads
+                    dim = lane_idx + item * cute.arch.WARP_SIZE
                     value = cutlass.Float32(0.0)
                     if context_idx == write_pos:
                         value = cutlass.Float32(main_kv[request_idx, dim])
@@ -138,7 +169,7 @@ class DSparkAttentionKernel:
             partial = cutlass.Float32(0.0)
             values = cute.make_rmem_tensor((self.elements_per_thread,), cutlass.Float32)
             for item in cutlass.range_constexpr(self.elements_per_thread):
-                dim = tidx + item * self.num_threads
+                dim = lane_idx + item * cute.arch.WARP_SIZE
                 value = cutlass.Float32(block_kv[request_idx, block_idx, dim])
                 values[item] = value
                 partial += q_values[item] * value
@@ -155,7 +186,7 @@ class DSparkAttentionKernel:
         sink_weight = self._exp(cutlass.Float32(attn_sink[head_idx]) - running_max)
         inv_denom = cutlass.Float32(1.0) / (running_sum + sink_weight)
         for item in cutlass.range_constexpr(self.elements_per_thread):
-            dim = tidx + item * self.num_threads
+            dim = lane_idx + item * cute.arch.WARP_SIZE
             output[request_idx, query_idx, head_idx, dim] = (accum[item] * inv_denom).to(
                 output.element_type
             )

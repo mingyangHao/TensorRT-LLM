@@ -19,10 +19,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _make_inputs(seed: int = 0, batch: int = 2):
+def _make_inputs(seed: int = 0, batch: int = 2, block: int = 5):
     torch.manual_seed(seed)
     device = torch.device("cuda")
-    block, heads, head_dim, window = 5, 24, 512, 128
+    heads, head_dim, window = 24, 512, 128
     q = torch.randn(batch, block, heads, head_dim, device=device, dtype=torch.bfloat16)
     main_kv = torch.randn(batch, head_dim, device=device, dtype=torch.bfloat16)
     block_kv = torch.randn(batch, block, head_dim, device=device, dtype=torch.bfloat16)
@@ -120,6 +120,60 @@ def test_cute_dsl_dspark_attention_compiles_once_across_batch_sizes():
     cache_info = _compile_fused_dspark_attention.cache_info()
     assert cache_info.misses == 1
     assert cache_info.hits == 1
+
+
+@pytest.mark.parametrize("block", (5, 6))
+@pytest.mark.parametrize(
+    ("warps_per_cta", "dynamic_context_loop"),
+    ((2, False), (4, False), (8, False), (1, True), (2, True)),
+)
+def test_cute_dsl_dspark_attention_tactic_is_bitwise_equal(
+    monkeypatch, block, warps_per_cta, dynamic_context_loop
+):
+    """Packing independent head warps must not change DSpark acceptance math."""
+    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import cute_dsl_dspark_attention
+
+    q, main_kv, block_kv, kv_cache, slots, _, sink = _make_inputs(
+        seed=1000 + block + warps_per_cta + int(dynamic_context_loop),
+        batch=3,
+        block=block,
+    )
+    # Exercise a partially filled row, a full window, and a wrapped window.
+    start_pos = torch.tensor([3, 127, 390], device=q.device, dtype=torch.int64)
+    scale = q.shape[-1] ** -0.5
+
+    baseline_cache = kv_cache.clone()
+    monkeypatch.setenv("TRTLLM_DSPARK_ATTENTION_WARPS_PER_CTA", "1")
+    monkeypatch.setenv("TRTLLM_DSPARK_ATTENTION_DYNAMIC_CONTEXT_LOOP", "0")
+    baseline = cute_dsl_dspark_attention(
+        q,
+        main_kv,
+        block_kv,
+        baseline_cache,
+        slots,
+        start_pos,
+        sink,
+        scale,
+    )
+
+    packed_cache = kv_cache.clone()
+    monkeypatch.setenv("TRTLLM_DSPARK_ATTENTION_WARPS_PER_CTA", str(warps_per_cta))
+    monkeypatch.setenv(
+        "TRTLLM_DSPARK_ATTENTION_DYNAMIC_CONTEXT_LOOP", str(int(dynamic_context_loop))
+    )
+    packed = cute_dsl_dspark_attention(
+        q,
+        main_kv,
+        block_kv,
+        packed_cache,
+        slots,
+        start_pos,
+        sink,
+        scale,
+    )
+
+    torch.testing.assert_close(packed, baseline, rtol=0, atol=0)
+    torch.testing.assert_close(packed_cache, baseline_cache, rtol=0, atol=0)
 
 
 def test_dspark_attention_forward_batched_fused_matches_fallback(monkeypatch):

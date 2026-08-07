@@ -4,18 +4,42 @@
 """Torch custom op for fused DSpark rolling-window attention."""
 
 import functools
+import os
 
 import cutlass
 import cutlass.cute as cute
 import torch
 
 from ..._utils import get_sm_version, is_sm_100f
+from ...logger import logger
 from ..cute_dsl_kernels.blackwell.dspark_attention import DSparkAttentionKernel
 
 _INDEX_DTYPE_TO_CUTLASS = {
     torch.int32: cutlass.Int32,
     torch.int64: cutlass.Int64,
 }
+
+_VALID_WARPS_PER_CTA = (1, 2, 4, 8)
+
+
+def _get_dspark_attention_warps_per_cta() -> int:
+    """Return the acceptance-preserving packed-warp tuning knob."""
+    value = int(os.environ.get("TRTLLM_DSPARK_ATTENTION_WARPS_PER_CTA", "1"))
+    if value not in _VALID_WARPS_PER_CTA:
+        raise ValueError(
+            "TRTLLM_DSPARK_ATTENTION_WARPS_PER_CTA must be one of "
+            f"{_VALID_WARPS_PER_CTA}; got {value}"
+        )
+    return value
+
+
+def _get_dspark_attention_dynamic_context_loop() -> bool:
+    value = os.environ.get("TRTLLM_DSPARK_ATTENTION_DYNAMIC_CONTEXT_LOOP", "0")
+    if value not in ("0", "1"):
+        raise ValueError(
+            f"TRTLLM_DSPARK_ATTENTION_DYNAMIC_CONTEXT_LOOP must be 0 or 1; got {value}"
+        )
+    return value == "1"
 
 
 def is_fused_dspark_attention_supported(
@@ -74,6 +98,8 @@ def _compile_fused_dspark_attention(
     cache_stride: tuple[int, ...],
     index_dtype: torch.dtype,
     softmax_scale: float,
+    warps_per_cta: int,
+    dynamic_context_loop: bool,
 ):
     # Batch is deliberately symbolic: DSpark's block/head geometry is fixed by
     # the model, while the generation batch changes from iteration to iteration.
@@ -116,6 +142,8 @@ def _compile_fused_dspark_attention(
         num_heads=num_heads,
         head_dim=head_dim,
         softmax_scale=softmax_scale,
+        warps_per_cta=warps_per_cta,
+        dynamic_context_loop=dynamic_context_loop,
     )
     return cute.compile(
         kernel,
@@ -156,6 +184,23 @@ def cute_dsl_dspark_attention(
             f"with head_dim=512 on SM100/SM103; got SM {get_sm_version()}"
         )
     output = torch.empty_like(q)
+    warps_per_cta = _get_dspark_attention_warps_per_cta()
+    dynamic_context_loop = _get_dspark_attention_dynamic_context_loop()
+    if q.shape[2] % warps_per_cta != 0:
+        raise ValueError(
+            "DSpark Attention num_heads must be divisible by warps_per_cta; "
+            f"got num_heads={q.shape[2]}, warps_per_cta={warps_per_cta}"
+        )
+    logger.info_once(
+        "DSpark Attention enabled: implementation=packed_warp, "
+        f"warps_per_cta={warps_per_cta}, dynamic_context_loop={dynamic_context_loop}, "
+        f"block={q.shape[1]}, "
+        f"heads={q.shape[2]}, head_dim={q.shape[3]}",
+        key=(
+            f"dspark_attention_packed_warp|warps_per_cta={warps_per_cta}|"
+            f"dynamic_context_loop={dynamic_context_loop}|block={q.shape[1]}"
+        ),
+    )
     compiled = _compile_fused_dspark_attention(
         q.shape[1],
         q.shape[2],
@@ -164,6 +209,8 @@ def cute_dsl_dspark_attention(
         tuple(kv_cache.stride()),
         slots.dtype,
         softmax_scale,
+        warps_per_cta,
+        dynamic_context_loop,
     )
     compiled(q, main_kv, block_kv, kv_cache, slots, start_pos, attn_sink, output)
     return output
