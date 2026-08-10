@@ -41,6 +41,9 @@ from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 if IS_CUTLASS_DSL_AVAILABLE:
     from ...custom_ops.dspark_attention_custom_op import (
         cute_dsl_dspark_attention,
+        cute_dsl_dspark_attention_rope,
+        get_dspark_attention_fuse_inverse_rope,
+        is_fused_dspark_attention_rope_supported,
         is_fused_dspark_attention_supported,
     )
     from ...custom_ops.dspark_rmsnorm_rope_custom_op import (
@@ -504,22 +507,52 @@ def dspark_attention_forward_batched(
     # callers stay pure.
     write_target = kv_cache if persist else kv_cache.clone()
     main_kv_flat = main_kv.squeeze(1).to(write_target.dtype)
+    inverse_rope_fused = False
+    inverse_rope_freqs = torch.view_as_real(blk_freqs)
     if IS_CUTLASS_DSL_AVAILABLE and is_fused_dspark_attention_supported(
         q, main_kv_flat, kv, write_target, slots, start_pos, attn_sink
     ):
         # One custom op performs the rolling-cache write/read, validity handling,
         # QK, attention-sink online softmax, and PV. In particular it creates no
         # topk index, gathered KV, score, or probability tensors.
-        o = cute_dsl_dspark_attention(
-            q,
-            main_kv_flat,
-            kv,
-            write_target,
-            slots,
-            start_pos,
-            attn_sink,
-            softmax_scale,
+        inverse_rope_fused = (
+            get_dspark_attention_fuse_inverse_rope()
+            and is_fused_dspark_attention_rope_supported(
+                q,
+                main_kv_flat,
+                kv,
+                write_target,
+                slots,
+                start_pos,
+                attn_sink,
+                inverse_rope_freqs,
+                rd,
+            )
         )
+        if inverse_rope_fused:
+            o = cute_dsl_dspark_attention_rope(
+                q,
+                main_kv_flat,
+                kv,
+                write_target,
+                slots,
+                start_pos,
+                attn_sink,
+                inverse_rope_freqs,
+                rd,
+                softmax_scale,
+            )
+        else:
+            o = cute_dsl_dspark_attention(
+                q,
+                main_kv_flat,
+                kv,
+                write_target,
+                slots,
+                start_pos,
+                attn_sink,
+                softmax_scale,
+            )
     else:
         slot_pos = start_pos % window_size  # [G]
         write_target[slots, slot_pos] = main_kv_flat
@@ -529,17 +562,18 @@ def dspark_attention_forward_batched(
         o = dspark_sparse_attn(
             q, kv_full, attn_sink, topk, softmax_scale
         )  # [G, block, h, head_dim]
-    o = _rmsnorm_rope_batched(
-        o,
-        kv_norm_w,
-        eps,
-        rd,
-        blk_freqs,
-        num_heads=n_heads,
-        apply_weight=False,
-        apply_rmsnorm=False,
-        inverse_rope=True,
-    )
+    if not inverse_rope_fused:
+        o = _rmsnorm_rope_batched(
+            o,
+            kv_norm_w,
+            eps,
+            rd,
+            blk_freqs,
+            num_heads=n_heads,
+            apply_weight=False,
+            apply_rmsnorm=False,
+            inverse_rope=True,
+        )
 
     # Grouped low-rank O projection.
     o = o.reshape(g, block, n_groups, -1)

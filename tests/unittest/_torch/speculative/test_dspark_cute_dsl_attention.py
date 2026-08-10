@@ -58,13 +58,15 @@ def _set_tactic(
     *,
     warps_per_cta: int,
     dynamic_context_loop: bool,
-    queries_per_warp: int = 1,
+    queries_per_warp: int | str = 1,
+    min_blocks_per_mp: int | str = 0,
 ) -> None:
     monkeypatch.setenv("TRTLLM_DSPARK_ATTENTION_WARPS_PER_CTA", str(warps_per_cta))
     monkeypatch.setenv(
         "TRTLLM_DSPARK_ATTENTION_DYNAMIC_CONTEXT_LOOP", str(int(dynamic_context_loop))
     )
     monkeypatch.setenv("TRTLLM_DSPARK_ATTENTION_QUERIES_PER_WARP", str(queries_per_warp))
+    monkeypatch.setenv("TRTLLM_DSPARK_ATTENTION_MIN_BLOCKS_PER_MP", str(min_blocks_per_mp))
 
 
 def _assert_bitwise_equal(actual: torch.Tensor, expected: torch.Tensor) -> None:
@@ -132,12 +134,17 @@ def _target_trace(draft_tokens: torch.Tensor, step: int) -> tuple[torch.Tensor, 
 @pytest.mark.parametrize(
     ("block", "batch", "expected"),
     (
-        (4, 3, 1),
-        (4, 4, 2),
-        (5, 7, 1),
-        (5, 8, 5),
-        (6, 3, 1),
-        (6, 4, 6),
+        (4, 1, 2),
+        (4, 2, 1),
+        (4, 3, 2),
+        (4, 4, 1),
+        (4, 5, 2),
+        (5, 5, 1),
+        (5, 6, 5),
+        (6, 1, 1),
+        (6, 2, 2),
+        (6, 6, 2),
+        (6, 7, 6),
     ),
 )
 def test_dspark_attention_auto_query_tile(monkeypatch, block, batch, expected):
@@ -150,6 +157,29 @@ def test_dspark_attention_auto_query_tile(monkeypatch, block, batch, expected):
 
     monkeypatch.setenv("TRTLLM_DSPARK_ATTENTION_QUERIES_PER_WARP", "auto")
     assert _get_dspark_attention_queries_per_warp(block, batch) == expected
+
+
+@pytest.mark.parametrize(
+    ("block", "batch", "query_tile", "expected"),
+    (
+        (4, 3, 2, 16),
+        (4, 5, 2, 16),
+        (4, 7, 2, 16),
+        (4, 8, 2, 0),
+        (5, 7, 5, 0),
+        (6, 6, 2, 0),
+    ),
+)
+def test_dspark_attention_auto_min_blocks(monkeypatch, block, batch, query_tile, expected):
+    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
+        _get_dspark_attention_min_blocks_per_mp,
+    )
+
+    monkeypatch.delenv("TRTLLM_DSPARK_ATTENTION_MIN_BLOCKS_PER_MP", raising=False)
+    assert _get_dspark_attention_min_blocks_per_mp(block, batch, query_tile) == expected
+
+    monkeypatch.setenv("TRTLLM_DSPARK_ATTENTION_MIN_BLOCKS_PER_MP", "auto")
+    assert _get_dspark_attention_min_blocks_per_mp(block, batch, query_tile) == expected
 
 
 def test_cute_dsl_dspark_attention_matches_reference():
@@ -199,6 +229,79 @@ def test_cute_dsl_dspark_attention_cuda_graph_replay():
 
 
 @pytest.mark.parametrize("block", (4, 5, 6))
+def test_dspark_attention_inverse_rope_epilogue_is_bitwise_equal(monkeypatch, block):
+    """Fused epilogue must match attention then standalone inverse RoPE bitwise."""
+    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
+        cute_dsl_dspark_attention,
+        cute_dsl_dspark_attention_rope,
+    )
+    from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
+        cute_dsl_dspark_rmsnorm_rope,
+    )
+    from tensorrt_llm._torch.models.dspark.attention import precompute_dspark_freqs_cis
+
+    q, main_kv, block_kv, kv_cache, slots, _, sink = _make_inputs(
+        seed=91 + block, batch=3, block=block
+    )
+    start_pos = torch.tensor([3, 127, 390], device=q.device, dtype=torch.int64)
+    rope_dim = 64
+    positions = start_pos.unsqueeze(1) + 1 + torch.arange(block, device=q.device)
+    freqs_cis = precompute_dspark_freqs_cis(
+        rope_dim, int(positions.max().item()) + 1, device=q.device
+    )
+    inverse_rope_freqs = torch.view_as_real(freqs_cis[positions]).contiguous()
+    scale = q.shape[-1] ** -0.5
+
+    baseline_cache = kv_cache.clone()
+    _set_tactic(monkeypatch, warps_per_cta=1, dynamic_context_loop=False)
+    baseline = cute_dsl_dspark_attention(
+        q,
+        main_kv,
+        block_kv,
+        baseline_cache,
+        slots,
+        start_pos,
+        sink,
+        scale,
+    )
+    baseline = cute_dsl_dspark_rmsnorm_rope(
+        baseline,
+        torch.ones(q.shape[-1], device=q.device, dtype=q.dtype),
+        inverse_rope_freqs.flatten(0, 1),
+        q.shape[2],
+        rope_dim,
+        0.0,
+        False,
+        False,
+        True,
+    )
+
+    candidate_cache = kv_cache.clone()
+    _set_tactic(
+        monkeypatch,
+        warps_per_cta=1,
+        dynamic_context_loop=True,
+        queries_per_warp="auto",
+        min_blocks_per_mp="auto",
+    )
+    candidate = cute_dsl_dspark_attention_rope(
+        q,
+        main_kv,
+        block_kv,
+        candidate_cache,
+        slots,
+        start_pos,
+        sink,
+        inverse_rope_freqs,
+        rope_dim,
+        scale,
+    )
+
+    _assert_bitwise_equal(candidate, baseline)
+    _assert_bitwise_equal(candidate_cache, baseline_cache)
+
+
+@pytest.mark.parametrize("block", (4, 5, 6))
 def test_candidate_cuda_graph_replay_is_bitwise_equal(monkeypatch, block):
     """Candidate graph replay must preserve the one-warp state trajectory."""
     from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import cute_dsl_dspark_attention
@@ -216,7 +319,8 @@ def test_candidate_cuda_graph_replay_is_bitwise_equal(monkeypatch, block):
         monkeypatch,
         warps_per_cta=1,
         dynamic_context_loop=True,
-        queries_per_warp={4: 2, 5: 5, 6: 6}[block],
+        queries_per_warp="auto",
+        min_blocks_per_mp="auto",
     )
     warmup_cache = initial_cache.clone()
     cute_dsl_dspark_attention(
@@ -363,12 +467,20 @@ def test_candidate_stateful_trace_preserves_exact_acceptance_length(monkeypatch,
     strict-acceptance implementation used by DSparkWorker. The test compares the
     integer AL numerator and denominator rather than rounded floating-point AL.
     """
-    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import cute_dsl_dspark_attention
+    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
+        cute_dsl_dspark_attention,
+        cute_dsl_dspark_attention_rope,
+    )
+    from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
+        cute_dsl_dspark_rmsnorm_rope,
+    )
+    from tensorrt_llm._torch.models.dspark.attention import precompute_dspark_freqs_cis
 
     torch.manual_seed(20260809 + block)
     device = torch.device("cuda")
     capacity, stages, window = 67, 3, 128
     heads, head_dim = 128, 512
+    rope_dim = 64
     scale = head_dim**-0.5
 
     cache_storage = torch.randn(
@@ -386,6 +498,8 @@ def test_candidate_stateful_trace_preserves_exact_acceptance_length(monkeypatch,
     assert not baseline_cache.is_contiguous()
 
     sink = torch.randn(heads, dtype=torch.float32, device=device) * 0.1
+    rope_weight = torch.ones(head_dim, dtype=torch.bfloat16, device=device)
+    freqs_cis = precompute_dspark_freqs_cis(rope_dim, 2048, device=device)
     slot_order = torch.randperm(capacity, device=device)
     position_boundaries = torch.tensor(
         [0, 1, 7, 63, 126, 127, 128, 255, 390, 511, 1023],
@@ -428,6 +542,8 @@ def test_candidate_stateful_trace_preserves_exact_acceptance_length(monkeypatch,
             dtype=torch.bfloat16,
             device=device,
         )
+        positions = start_pos.unsqueeze(1) + 1 + torch.arange(block, device=device)
+        inverse_rope_freqs = torch.view_as_real(freqs_cis[positions]).contiguous()
 
         _set_tactic(monkeypatch, warps_per_cta=1, dynamic_context_loop=False)
         baseline = cute_dsl_dspark_attention(
@@ -440,13 +556,25 @@ def test_candidate_stateful_trace_preserves_exact_acceptance_length(monkeypatch,
             sink,
             scale,
         )
+        baseline = cute_dsl_dspark_rmsnorm_rope(
+            baseline,
+            rope_weight,
+            inverse_rope_freqs.flatten(0, 1),
+            heads,
+            rope_dim,
+            0.0,
+            False,
+            False,
+            True,
+        )
         _set_tactic(
             monkeypatch,
             warps_per_cta=1,
             dynamic_context_loop=True,
-            queries_per_warp={4: 2, 5: 5, 6: 6}[block],
+            queries_per_warp="auto",
+            min_blocks_per_mp="auto",
         )
-        candidate = cute_dsl_dspark_attention(
+        candidate = cute_dsl_dspark_attention_rope(
             q,
             main_kv,
             block_kv,
@@ -454,6 +582,8 @@ def test_candidate_stateful_trace_preserves_exact_acceptance_length(monkeypatch,
             slots,
             start_pos,
             sink,
+            inverse_rope_freqs,
+            rope_dim,
             scale,
         )
 
@@ -551,7 +681,7 @@ def test_dspark_attention_forward_batched_fused_matches_fallback(monkeypatch):
     fused_cache = cache_storage[:, 1]
     fallback_cache = fused_cache.clone()
     calls = {"attention": 0, "rmsnorm_rope": 0}
-    fused_attention = dspark_attention.cute_dsl_dspark_attention
+    fused_attention = dspark_attention.cute_dsl_dspark_attention_rope
     fused_rmsnorm_rope = dspark_attention.cute_dsl_dspark_rmsnorm_rope
 
     def counted_attention(*args):
@@ -563,13 +693,17 @@ def test_dspark_attention_forward_batched_fused_matches_fallback(monkeypatch):
         return fused_rmsnorm_rope(*args)
 
     with monkeypatch.context() as patch:
-        patch.setattr(dspark_attention, "cute_dsl_dspark_attention", counted_attention)
+        patch.setattr(
+            dspark_attention,
+            "cute_dsl_dspark_attention_rope",
+            counted_attention,
+        )
         patch.setattr(dspark_attention, "cute_dsl_dspark_rmsnorm_rope", counted_rmsnorm_rope)
         actual = dspark_attention.dspark_attention_forward_batched(
             x, main_x, start_pos, fused_cache, slots, **kwargs
         )
 
-    assert calls == {"attention": 1, "rmsnorm_rope": 5}
+    assert calls == {"attention": 1, "rmsnorm_rope": 4}
 
     with monkeypatch.context() as patch:
         patch.setattr(

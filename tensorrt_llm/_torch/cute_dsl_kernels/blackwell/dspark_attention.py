@@ -35,6 +35,8 @@ class DSparkAttentionKernel:
         warps_per_cta: int = 1,
         dynamic_context_loop: bool = False,
         queries_per_warp: int = 1,
+        min_blocks_per_mp: int = 0,
+        inverse_rope_dim: int = 0,
     ):
         if warps_per_cta not in (1, 2, 4, 8):
             raise ValueError(
@@ -57,6 +59,15 @@ class DSparkAttentionKernel:
                 f"of block_size; got block_size={block_size}, "
                 f"queries_per_warp={queries_per_warp}"
             )
+        if (
+            inverse_rope_dim < 0
+            or inverse_rope_dim > head_dim
+            or inverse_rope_dim % (2 * cute.arch.WARP_SIZE) != 0
+        ):
+            raise ValueError(
+                "DSparkAttentionKernel inverse_rope_dim must be a multiple of 64 "
+                f"in [0, {head_dim}]; got {inverse_rope_dim}"
+            )
         self.window_size = window_size
         self.block_size = block_size
         self.num_heads = num_heads
@@ -67,6 +78,11 @@ class DSparkAttentionKernel:
         self.softmax_scale = softmax_scale
         self.dynamic_context_loop = dynamic_context_loop
         self.queries_per_warp = queries_per_warp
+        self.min_blocks_per_mp = min_blocks_per_mp
+        self.inverse_rope_dim = inverse_rope_dim
+        self.nope_dim = head_dim - inverse_rope_dim
+        self.nope_elements_per_thread = self.nope_dim // cute.arch.WARP_SIZE
+        self.rope_elements_per_thread = inverse_rope_dim // cute.arch.WARP_SIZE
 
     @cute.jit
     def __call__(
@@ -78,12 +94,21 @@ class DSparkAttentionKernel:
         slots: cute.Tensor,
         start_pos: cute.Tensor,
         attn_sink: cute.Tensor,
+        inverse_rope_freqs: cute.Tensor,
         output: cute.Tensor,
         stream: cuda.CUstream,
     ):
         if cutlass.const_expr(self.queries_per_warp > 1):
             self.fused_queries_kernel(
-                q, main_kv, block_kv, kv_cache, slots, start_pos, attn_sink, output
+                q,
+                main_kv,
+                block_kv,
+                kv_cache,
+                slots,
+                start_pos,
+                attn_sink,
+                inverse_rope_freqs,
+                output,
             ).launch(
                 grid=[
                     q.shape[0],
@@ -92,12 +117,24 @@ class DSparkAttentionKernel:
                 ],
                 block=[self.num_threads, 1, 1],
                 stream=stream,
+                min_blocks_per_mp=self.min_blocks_per_mp,
             )
         else:
-            self.kernel(q, main_kv, block_kv, kv_cache, slots, start_pos, attn_sink, output).launch(
+            self.kernel(
+                q,
+                main_kv,
+                block_kv,
+                kv_cache,
+                slots,
+                start_pos,
+                attn_sink,
+                inverse_rope_freqs,
+                output,
+            ).launch(
                 grid=[q.shape[0], self.block_size, self.num_heads // self.warps_per_cta],
                 block=[self.num_threads, 1, 1],
                 stream=stream,
+                min_blocks_per_mp=self.min_blocks_per_mp,
             )
 
     @cute.jit
@@ -114,6 +151,7 @@ class DSparkAttentionKernel:
         slots: cute.Tensor,
         start_pos: cute.Tensor,
         attn_sink: cute.Tensor,
+        inverse_rope_freqs: cute.Tensor,
         output: cute.Tensor,
     ):
         request_idx, query_idx, head_group_idx = cute.arch.block_idx()
@@ -206,11 +244,31 @@ class DSparkAttentionKernel:
 
         sink_weight = self._exp(cutlass.Float32(attn_sink[head_idx]) - running_max)
         inv_denom = cutlass.Float32(1.0) / (running_sum + sink_weight)
-        for item in cutlass.range_constexpr(self.elements_per_thread):
+        for item in cutlass.range_constexpr(self.nope_elements_per_thread):
             dim = lane_idx + item * cute.arch.WARP_SIZE
             output[request_idx, query_idx, head_idx, dim] = (accum[item] * inv_denom).to(
                 output.element_type
             )
+
+        # The production path immediately applies inverse RoPE to the last 64
+        # dimensions. Preserve the former kernel boundary's BF16 rounding, then
+        # exchange adjacent real/imaginary values within the warp. This removes
+        # the intermediate output write/read without changing any QK, softmax,
+        # PV, or RoPE arithmetic.
+        for rope_item in cutlass.range_constexpr(self.rope_elements_per_thread):
+            item = self.nope_elements_per_thread + rope_item
+            dim = lane_idx + item * cute.arch.WARP_SIZE
+            rounded = cutlass.Float32((accum[item] * inv_denom).to(output.element_type))
+            partner = cute.arch.shuffle_sync_bfly(rounded, offset=1)
+            pair = (dim - self.nope_dim) // 2
+            cos = cutlass.Float32(inverse_rope_freqs[request_idx, query_idx, pair, 0])
+            sin = cutlass.Float32(inverse_rope_freqs[request_idx, query_idx, pair, 1])
+            rotated = cutlass.Float32(0.0)
+            if lane_idx % 2 == 0:
+                rotated = rounded * cos + partner * sin
+            else:
+                rotated = rounded * cos - partner * sin
+            output[request_idx, query_idx, head_idx, dim] = rotated.to(output.element_type)
 
     @cute.kernel
     def fused_queries_kernel(
@@ -222,6 +280,7 @@ class DSparkAttentionKernel:
         slots: cute.Tensor,
         start_pos: cute.Tensor,
         attn_sink: cute.Tensor,
+        inverse_rope_freqs: cute.Tensor,
         output: cute.Tensor,
     ):
         request_idx, query_group_idx, head_group_idx = cute.arch.block_idx()
@@ -336,8 +395,25 @@ class DSparkAttentionKernel:
             )
             inv_denom = cutlass.Float32(1.0) / (running_sum[local_query_idx] + sink_weight)
             query_idx = query_start + local_query_idx
-            for item in cutlass.range_constexpr(self.elements_per_thread):
+            for item in cutlass.range_constexpr(self.nope_elements_per_thread):
                 dim = lane_idx + item * cute.arch.WARP_SIZE
                 output[request_idx, query_idx, head_idx, dim] = (
                     accum[local_query_idx, item] * inv_denom
                 ).to(output.element_type)
+
+            for rope_item in cutlass.range_constexpr(self.rope_elements_per_thread):
+                item = self.nope_elements_per_thread + rope_item
+                dim = lane_idx + item * cute.arch.WARP_SIZE
+                rounded = cutlass.Float32(
+                    (accum[local_query_idx, item] * inv_denom).to(output.element_type)
+                )
+                partner = cute.arch.shuffle_sync_bfly(rounded, offset=1)
+                pair = (dim - self.nope_dim) // 2
+                cos = cutlass.Float32(inverse_rope_freqs[request_idx, query_idx, pair, 0])
+                sin = cutlass.Float32(inverse_rope_freqs[request_idx, query_idx, pair, 1])
+                rotated = cutlass.Float32(0.0)
+                if lane_idx % 2 == 0:
+                    rotated = rounded * cos + partner * sin
+                else:
+                    rotated = rounded * cos - partner * sin
+                output[request_idx, query_idx, head_idx, dim] = rotated.to(output.element_type)
