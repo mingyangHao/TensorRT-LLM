@@ -3,6 +3,8 @@
 
 """GPU correctness tests for the fused DSpark CuteDSL attention op."""
 
+import types
+
 import pytest
 import torch
 
@@ -11,7 +13,10 @@ from tensorrt_llm._torch.models.dspark.attention import (
     dspark_sparse_attn,
     get_dspark_topk_idxs_batched,
 )
+from tensorrt_llm._torch.speculative.dspark import DSparkWorker
+from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not IS_CUTLASS_DSL_AVAILABLE or not is_sm_100f(),
@@ -46,6 +51,75 @@ def _reference(q, main_kv, block_kv, kv_cache, slots, start_pos, sink):
     kv_full = torch.cat([cache[slots], block_kv], dim=1)
     topk = get_dspark_topk_idxs_batched(window, q.shape[1], start_pos)
     return dspark_sparse_attn(q, kv_full, sink, topk, q.shape[-1] ** -0.5), cache
+
+
+def _set_tactic(monkeypatch, *, warps_per_cta: int, dynamic_context_loop: bool) -> None:
+    monkeypatch.setenv("TRTLLM_DSPARK_ATTENTION_WARPS_PER_CTA", str(warps_per_cta))
+    monkeypatch.setenv(
+        "TRTLLM_DSPARK_ATTENTION_DYNAMIC_CONTEXT_LOOP", str(int(dynamic_context_loop))
+    )
+
+
+def _assert_bitwise_equal(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    """Compare tensor storage bits, including signed zero and NaN payloads."""
+    assert actual.dtype == expected.dtype
+    assert actual.shape == expected.shape
+    torch.testing.assert_close(actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0)
+
+
+def _make_strict_acceptance_worker(block: int, monkeypatch):
+    config = types.SimpleNamespace(
+        max_draft_len=block,
+        spec_dec_mode=SpeculativeDecodingMode.DSPARK,
+    )
+    worker = DSparkWorker(config, Mapping())
+    worker.force_num_accepted_tokens = 0.0
+    target_tokens = {}
+
+    def fixed_target_sampler(_logits, _metadata, _num_contexts, _batch_size):
+        return target_tokens["value"].reshape(-1)
+
+    monkeypatch.setattr(worker, "_sample_tokens_for_batch", fixed_target_sampler)
+    return worker, target_tokens
+
+
+def _strict_accept(
+    worker,
+    target_holder,
+    draft_tokens: torch.Tensor,
+    target_tokens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch, block = draft_tokens.shape
+    target_holder["value"] = target_tokens
+    logits = torch.empty(batch * (block + 1), 1, device=draft_tokens.device)
+    metadata = types.SimpleNamespace(is_cuda_graph=False)
+    return worker._sample_and_accept_draft_tokens_base(
+        logits,
+        draft_tokens,
+        num_contexts=0,
+        batch_size=batch,
+        spec_metadata=metadata,
+    )
+
+
+def _target_trace(draft_tokens: torch.Tensor, step: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build fixed target tokens with every possible accepted-prefix length."""
+    batch, block = draft_tokens.shape
+    rows = torch.arange(batch, device=draft_tokens.device)
+    accepted_drafts = (rows + step) % (block + 1)
+    target_tokens = torch.empty(batch, block + 1, dtype=torch.int32, device=draft_tokens.device)
+    target_tokens[:, :block] = draft_tokens
+    target_tokens[:, block] = (rows + step) % 32
+
+    rejected = accepted_drafts < block
+    rejected_rows = rows[rejected]
+    rejected_cols = accepted_drafts[rejected]
+    target_tokens[rejected_rows, rejected_cols] = (
+        draft_tokens[rejected_rows, rejected_cols] + 1
+    ) % 32
+    # The production acceptance path reports sequence lengths as int32. Keep
+    # the expected contract equally strict so dtype drift also fails the test.
+    return target_tokens, (accepted_drafts + 1).to(torch.int32)
 
 
 def test_cute_dsl_dspark_attention_matches_reference():
@@ -92,6 +166,74 @@ def test_cute_dsl_dspark_attention_cuda_graph_replay():
 
     torch.testing.assert_close(captured, expected, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(kv_cache, expected_cache, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("block", (5, 6))
+def test_candidate_cuda_graph_replay_is_bitwise_equal(monkeypatch, block):
+    """Candidate graph replay must preserve the one-warp state trajectory."""
+    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import cute_dsl_dspark_attention
+
+    q, main_kv, block_kv, kv_cache, slots, _, sink = _make_inputs(
+        seed=17 + block, batch=3, block=block
+    )
+    scale = q.shape[-1] ** -0.5
+    start_pos = torch.tensor([3, 127, 390], device=q.device, dtype=torch.int64)
+    initial_cache = kv_cache.clone()
+    baseline_cache = initial_cache.clone()
+    candidate_cache = initial_cache.clone()
+
+    _set_tactic(monkeypatch, warps_per_cta=2, dynamic_context_loop=True)
+    warmup_cache = initial_cache.clone()
+    cute_dsl_dspark_attention(
+        q,
+        main_kv,
+        block_kv,
+        warmup_cache,
+        slots,
+        start_pos,
+        sink,
+        scale,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        candidate = cute_dsl_dspark_attention(
+            q,
+            main_kv,
+            block_kv,
+            candidate_cache,
+            slots,
+            start_pos,
+            sink,
+            scale,
+        )
+
+    # Capture executes the graph once. Reset the persistent state so both paths
+    # start the replay trace from the same cache contents.
+    candidate_cache.copy_(initial_cache)
+    positions = ([3, 127, 390], [4, 128, 391], [126, 255, 511], [127, 256, 512])
+    for replay, values in enumerate(positions):
+        torch.manual_seed(1700 + block * 10 + replay)
+        q.copy_(torch.randn_like(q))
+        main_kv.copy_(torch.randn_like(main_kv))
+        block_kv.copy_(torch.randn_like(block_kv))
+        start_pos.copy_(torch.tensor(values, device=q.device, dtype=start_pos.dtype))
+        _set_tactic(monkeypatch, warps_per_cta=1, dynamic_context_loop=False)
+        baseline = cute_dsl_dspark_attention(
+            q,
+            main_kv,
+            block_kv,
+            baseline_cache,
+            slots,
+            start_pos,
+            sink,
+            scale,
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_bitwise_equal(candidate, baseline)
+        _assert_bitwise_equal(candidate_cache, baseline_cache)
 
 
 def test_cute_dsl_dspark_attention_compiles_once_across_batch_sizes():
@@ -174,6 +316,158 @@ def test_cute_dsl_dspark_attention_tactic_is_bitwise_equal(
 
     torch.testing.assert_close(packed, baseline, rtol=0, atol=0)
     torch.testing.assert_close(packed_cache, baseline_cache, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("block", (5, 6))
+def test_candidate_stateful_trace_preserves_exact_acceptance_length(monkeypatch, block):
+    """Production-shaped stateful A/B must preserve every exact AL counter.
+
+    The scheduler trace is fixed before either tactic runs. Both tactics consume
+    identical tensors and independently evolve strided rolling-window caches.
+    Draft proposals derived from the attention result are verified by the same
+    strict-acceptance implementation used by DSparkWorker. The test compares the
+    integer AL numerator and denominator rather than rounded floating-point AL.
+    """
+    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import cute_dsl_dspark_attention
+
+    torch.manual_seed(20260809 + block)
+    device = torch.device("cuda")
+    capacity, stages, window = 67, 3, 128
+    heads, head_dim = 128, 512
+    scale = head_dim**-0.5
+
+    cache_storage = torch.randn(
+        capacity,
+        stages,
+        window,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    baseline_storage = cache_storage.clone()
+    candidate_storage = cache_storage.clone()
+    baseline_cache = baseline_storage[:, 1]
+    candidate_cache = candidate_storage[:, 1]
+    assert not baseline_cache.is_contiguous()
+
+    sink = torch.randn(heads, dtype=torch.float32, device=device) * 0.1
+    slot_order = torch.randperm(capacity, device=device)
+    position_boundaries = torch.tensor(
+        [0, 1, 7, 63, 126, 127, 128, 255, 390, 511, 1023],
+        dtype=torch.int64,
+        device=device,
+    )
+    position_by_slot = position_boundaries[
+        torch.arange(capacity, device=device) % position_boundaries.numel()
+    ].clone()
+    batch_trace = (1, 8, 32, 64, 16, 4, 64, 32)
+
+    worker, target_holder = _make_strict_acceptance_worker(block, monkeypatch)
+    baseline_totals = dict(accepted=0, drafted=0, requests=0)
+    candidate_totals = dict(accepted=0, drafted=0, requests=0)
+
+    for step, batch in enumerate(batch_trace):
+        slots = torch.roll(slot_order, shifts=step * 7)[:batch].contiguous()
+        if step in (3, 6):
+            # Reset two physical rows before reusing them for new logical
+            # requests, matching DSparkWorker's slot lifecycle.
+            reused = slots[-min(2, batch) :]
+            baseline_cache[reused].zero_()
+            candidate_cache[reused].zero_()
+            position_by_slot[reused] = position_boundaries[step]
+
+        start_pos = position_by_slot[slots].contiguous()
+        q = torch.randn(
+            batch,
+            block,
+            heads,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        main_kv = torch.randn(batch, head_dim, dtype=torch.bfloat16, device=device)
+        block_kv = torch.randn(
+            batch,
+            block,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+
+        _set_tactic(monkeypatch, warps_per_cta=1, dynamic_context_loop=False)
+        baseline = cute_dsl_dspark_attention(
+            q,
+            main_kv,
+            block_kv,
+            baseline_cache,
+            slots,
+            start_pos,
+            sink,
+            scale,
+        )
+        _set_tactic(monkeypatch, warps_per_cta=2, dynamic_context_loop=True)
+        candidate = cute_dsl_dspark_attention(
+            q,
+            main_kv,
+            block_kv,
+            candidate_cache,
+            slots,
+            start_pos,
+            sink,
+            scale,
+        )
+
+        _assert_bitwise_equal(candidate, baseline)
+        _assert_bitwise_equal(candidate_storage, baseline_storage)
+
+        baseline_draft = baseline[:, :, 0, :32].float().argmax(dim=-1).to(torch.int32)
+        candidate_draft = candidate[:, :, 0, :32].float().argmax(dim=-1).to(torch.int32)
+        torch.testing.assert_close(candidate_draft, baseline_draft, rtol=0, atol=0)
+        target_tokens, expected_lengths = _target_trace(baseline_draft, step)
+
+        baseline_accepted, baseline_lengths = _strict_accept(
+            worker, target_holder, baseline_draft, target_tokens
+        )
+        candidate_accepted, candidate_lengths = _strict_accept(
+            worker, target_holder, candidate_draft, target_tokens
+        )
+        torch.testing.assert_close(candidate_accepted, baseline_accepted, rtol=0, atol=0)
+        torch.testing.assert_close(candidate_lengths, baseline_lengths, rtol=0, atol=0)
+        torch.testing.assert_close(baseline_lengths, expected_lengths, rtol=0, atol=0)
+
+        for totals, lengths in (
+            (baseline_totals, baseline_lengths),
+            (candidate_totals, candidate_lengths),
+        ):
+            totals["accepted"] += int((lengths - 1).sum().item())
+            totals["drafted"] += batch * block
+            totals["requests"] += batch
+
+        # DSpark advances its rolling position by target + accepted draft
+        # tokens. Because the acceptance tensors are exact, the subsequent
+        # cache trace is also identical by construction.
+        position_by_slot[slots] += baseline_lengths.to(position_by_slot.dtype)
+
+    expected_totals = {
+        "accepted": sum(
+            (row + step) % (block + 1)
+            for step, batch in enumerate(batch_trace)
+            for row in range(batch)
+        ),
+        "drafted": sum(batch_trace) * block,
+        "requests": sum(batch_trace),
+    }
+    assert candidate_totals == baseline_totals == expected_totals
+    assert 0 < expected_totals["accepted"] < expected_totals["drafted"]
+    baseline_al = (
+        baseline_totals["accepted"] + baseline_totals["requests"],
+        baseline_totals["requests"],
+    )
+    candidate_al = (
+        candidate_totals["accepted"] + candidate_totals["requests"],
+        candidate_totals["requests"],
+    )
+    assert candidate_al == baseline_al
 
 
 def test_dspark_attention_forward_batched_fused_matches_fallback(monkeypatch):
