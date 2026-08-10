@@ -57,12 +57,15 @@ Run the committed correctness test first:
 ```bash
 python3 -m pytest -q \
   tests/unittest/_torch/speculative/test_dspark_cute_dsl_attention.py \
-  -k tactic_is_bitwise_equal
+  -k 'candidate_cuda_graph_replay_is_bitwise_equal or candidate_stateful_trace_preserves_exact_acceptance_length'
 ```
 
-This covers block sizes 5 and 6, partially filled windows, full windows, and
-wrapped windows. It requires exact output and KV-cache equality (`rtol=0`,
-`atol=0`).
+This covers draft lengths 4, 5, and 6, partially filled windows, full windows, and
+wrapped windows. It compares output and the complete KV backing storage byte by
+byte, exercises CUDA graph replay with changing inputs, and passes the resulting
+draft IDs through the production DSpark strict-acceptance implementation. The
+accepted-token tensor, every per-request accepted length, and the integer AL
+numerator and denominator must be identical.
 
 The following standalone microbenchmark uses the production shape: BF16,
 128 query heads, head dimension 512, a 128-row rolling window, and a strided
@@ -128,7 +131,7 @@ def time_one(name, args):
     return start.elapsed_time(end) * 1000.0 / ITERS
 
 
-for block in (5, 6):
+for block in (4, 5, 6):
     for position in (7, 63, 127, 390):
         torch.manual_seed(10000 + block * 1000 + position)
         q = torch.randn(
@@ -268,6 +271,7 @@ export BENCH_CONFIG=/path/to/production_dspark.yml
 export DATASET_DIR=/path/to/dspark_ab_datasets
 export RUN_ROOT=/path/to/dspark_ab_results
 export NUM_REQUESTS=512
+export DSPARK_DRAFT_LEN=5
 
 mkdir -p "$DATASET_DIR" "$RUN_ROOT"
 
@@ -383,6 +387,33 @@ The candidate log must contain `warps_per_cta=2` and
 
 ## 4. Enforce exact output and DSpark AL
 
+Keep the two acceptance checks separate:
+
+1. The candidate and baseline must have identical integer acceptance counters
+   for every paired run. This is the exact kernel-preservation gate.
+2. On the canonical DSpark generation workload, the baseline AL must also
+   reproduce the model-level reference for the configured draft length,
+   rounded to two decimal places. Do not apply these values to a different
+   prompt-length, concurrency, or end-to-end workload.
+
+| Draft length | Model AL reference |
+| ---: | ---: |
+| 4 | 3.72 |
+| 5 | 4.11 |
+| 6 | 4.32 |
+
+These model references are not expected values for the synthetic kernel unit
+test. That test deliberately exercises every accepted-prefix length and only
+requires the candidate and one-warp paths to match exactly. Do not tune a
+synthetic target-token distribution to manufacture one of the model AL values.
+When running the model-level gate, use a checkpoint whose configured
+`dspark_block_size` equals the selected draft length, and set
+`max_draft_len` to the same value. TensorRT LLM intentionally rejects a
+`block_size` override that differs from the checkpoint. For example, the
+current DeepSeek-V4-Pro-DSpark checkpoint has `dspark_block_size=5`, so only
+the DL=5 reference applies to it; DL=4 and DL=6 require their corresponding
+checkpoints. Keep the workload and scheduler configuration fixed.
+
 First compare complete output-token JSON objects. This is a stronger end-to-end
 check than comparing AL alone.
 
@@ -428,6 +459,7 @@ python3 - "$RUN_ROOT" <<'PY'
 import ast
 from fractions import Fraction
 import json
+import os
 import pathlib
 import sys
 
@@ -523,6 +555,15 @@ def collect(path):
 
 
 root = pathlib.Path(sys.argv[1])
+draft_len = int(os.environ["DSPARK_DRAFT_LEN"])
+al_references = {
+    4: Fraction(372, 100),
+    5: Fraction(411, 100),
+    6: Fraction(432, 100),
+}
+if draft_len not in al_references:
+    raise SystemExit(f"no canonical AL reference for draft length {draft_len}")
+
 for phase in ("gen_only", "e2e"):
     baseline = sorted((root / "baseline" / phase).glob("r*/iterations.jsonl"))
     candidate = sorted((root / "candidate" / phase).glob("r*/iterations.jsonl"))
@@ -543,6 +584,16 @@ for phase in ("gen_only", "e2e"):
                 f"{phase}: DSpark acceptance mismatch for {lhs} vs {rhs}: "
                 f"{mismatches}"
             )
+
+        if phase == "gen_only":
+            reference = al_references[draft_len]
+            half_cent = Fraction(1, 200)
+            if not reference - half_cent <= baseline_stats["al"] < reference + half_cent:
+                raise SystemExit(
+                    f"{phase}: DL={draft_len} model AL reference mismatch: "
+                    f"actual={float(baseline_stats['al']):.9f}, "
+                    f"expected={float(reference):.2f} after two-decimal rounding"
+                )
 
         print(
             f"{phase} {lhs.parent.name}: exact DSpark acceptance PASS; "

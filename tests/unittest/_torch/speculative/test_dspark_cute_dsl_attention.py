@@ -168,7 +168,7 @@ def test_cute_dsl_dspark_attention_cuda_graph_replay():
     torch.testing.assert_close(kv_cache, expected_cache, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("block", (5, 6))
+@pytest.mark.parametrize("block", (4, 5, 6))
 def test_candidate_cuda_graph_replay_is_bitwise_equal(monkeypatch, block):
     """Candidate graph replay must preserve the one-warp state trajectory."""
     from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import cute_dsl_dspark_attention
@@ -264,7 +264,7 @@ def test_cute_dsl_dspark_attention_compiles_once_across_batch_sizes():
     assert cache_info.hits == 1
 
 
-@pytest.mark.parametrize("block", (5, 6))
+@pytest.mark.parametrize("block", (4, 5, 6))
 @pytest.mark.parametrize(
     ("warps_per_cta", "dynamic_context_loop"),
     ((2, False), (4, False), (8, False), (1, True), (2, True)),
@@ -318,7 +318,7 @@ def test_cute_dsl_dspark_attention_tactic_is_bitwise_equal(
     torch.testing.assert_close(packed_cache, baseline_cache, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("block", (5, 6))
+@pytest.mark.parametrize("block", (4, 5, 6))
 def test_candidate_stateful_trace_preserves_exact_acceptance_length(monkeypatch, block):
     """Production-shaped stateful A/B must preserve every exact AL counter.
 
