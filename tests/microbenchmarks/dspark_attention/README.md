@@ -1,7 +1,7 @@
 # DSpark Attention Performance and Acceptance Validation
 
-This runbook compares the current one-warp DSpark Attention kernel with the
-acceptance-preserving packed-warp tactic. It covers both kernel-only performance
+This runbook compares the current one-query-per-warp DSpark Attention kernel
+with the acceptance-preserving query-fused tactic. It covers kernel-only performance
 and the complete DSpark module in context-only, generation-only, and end-to-end
 workloads.
 
@@ -20,15 +20,19 @@ tactic even when its kernel or end-to-end timing is faster.
 
 ## Tactics under test
 
-The current PR behavior remains the default and is the baseline.
+The current PR behavior is the explicit baseline. The optimized implementation
+selects a query tile from the draft length and runtime batch size; an override is
+available for reproducible A/B tests.
 
-| Variant | `TRTLLM_DSPARK_ATTENTION_WARPS_PER_CTA` | `TRTLLM_DSPARK_ATTENTION_DYNAMIC_CONTEXT_LOOP` |
-| --- | ---: | ---: |
-| Baseline | 1 | 0 |
-| Candidate | 2 | 1 |
+| Variant | `TRTLLM_DSPARK_ATTENTION_WARPS_PER_CTA` | `TRTLLM_DSPARK_ATTENTION_DYNAMIC_CONTEXT_LOOP` | `TRTLLM_DSPARK_ATTENTION_QUERIES_PER_WARP` |
+| --- | ---: | ---: | --- |
+| Baseline | 1 | 0 | `1` |
+| Candidate | 1 | 1 | `auto` |
 
-Set both variables before the process starts. The CuteDSL compilation cache
-includes both values, so each combination compiles to a distinct kernel.
+Set all three variables before the process starts. The CuteDSL compilation cache
+includes all three resolved values, so each combination compiles to a distinct
+kernel. `auto` uses one query per warp for under-filled small batches, two queries
+for DL4 throughput batches, and a full-block tile for DL5/DL6 throughput batches.
 
 ## Test environment
 
@@ -95,15 +99,16 @@ ITERS = 100
 REPEATS = 7
 
 TACTICS = {
-    "baseline": ("1", "0"),
-    "candidate": ("2", "1"),
+    "baseline": ("1", "0", "1"),
+    "candidate": ("1", "1", "auto"),
 }
 
 
 def set_tactic(name):
-    warps, dynamic = TACTICS[name]
+    warps, dynamic, queries = TACTICS[name]
     os.environ["TRTLLM_DSPARK_ATTENTION_WARPS_PER_CTA"] = warps
     os.environ["TRTLLM_DSPARK_ATTENTION_DYNAMIC_CONTEXT_LOOP"] = dynamic
+    os.environ["TRTLLM_DSPARK_ATTENTION_QUERIES_PER_WARP"] = queries
 
 
 def invoke(q, main_kv, block_kv, cache, slots, start_pos, sink):
@@ -220,12 +225,33 @@ not release numbers; rerun the script in the target environment.
 
 | Block | Position | Baseline (us) | Candidate (us) | Gain |
 | ---: | ---: | ---: | ---: | ---: |
-| 5 | 7 | 165.396 | 117.489 | +28.965% |
-| 5 | 63 | 633.065 | 601.933 | +4.918% |
-| 5 | 127 | 1184.801 | 1156.680 | +2.374% |
-| 6 | 7 | 205.401 | 148.445 | +27.730% |
-| 6 | 63 | 762.712 | 726.016 | +4.811% |
-| 6 | 127 | 1421.179 | 1388.282 | +2.315% |
+| 4 | 390 | 703.398 | 547.266 | +22.197% |
+| 5 | 390 | 878.143 | 687.788 | +21.677% |
+| 6 | 390 | 1052.975 | 786.381 | +25.318% |
+
+These numbers use the production steady-state window, not an early-position
+shortcut. The query-fused kernel keeps independent online-softmax state for
+multiple draft queries but loads their common MQA KV row only once. DL4 uses a
+two-query tile; DL5 and DL6 use their complete draft block at throughput batch
+sizes. The valid-token traversal and lane-local FP32 arithmetic order for every
+query remain unchanged.
+
+An Nsight Compute replay of the DL5, batch-64, position-390 case confirms that
+the gain is structural rather than timer noise:
+
+| Metric | Baseline | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Kernel duration | 917.60 us | 707.65 us | -22.88% |
+| Executed instructions | 708,282,816 | 430,639,552 | -39.20% |
+| Registers/thread | 72 | 254 | +182 |
+| Local-memory spills | 0 | 0 | unchanged |
+| L1/TEX throughput | 78.40% | 23.43% | -54.97 pp |
+| L2 throughput | 25.01% | 6.68% | -18.33 pp |
+
+Query fusion reduces the launch grid from 40,960 to 8,192 one-warp CTAs and
+eliminates repeated KV loads, address generation, and loop control. The larger
+live query/softmax state intentionally spends registers to obtain that reuse;
+the production tile remains spill-free.
 
 ## 2. Prepare the complete DSpark A/B test
 
@@ -323,10 +349,12 @@ run_one() {
     baseline)
       export TRTLLM_DSPARK_ATTENTION_WARPS_PER_CTA=1
       export TRTLLM_DSPARK_ATTENTION_DYNAMIC_CONTEXT_LOOP=0
+      export TRTLLM_DSPARK_ATTENTION_QUERIES_PER_WARP=1
       ;;
     candidate)
-      export TRTLLM_DSPARK_ATTENTION_WARPS_PER_CTA=2
+      export TRTLLM_DSPARK_ATTENTION_WARPS_PER_CTA=1
       export TRTLLM_DSPARK_ATTENTION_DYNAMIC_CONTEXT_LOOP=1
+      export TRTLLM_DSPARK_ATTENTION_QUERIES_PER_WARP=auto
       ;;
     *)
       echo "unknown variant: $variant" >&2
@@ -381,9 +409,10 @@ rg "DSparkWorker initialized" "$RUN_ROOT"/*/*/*/run.log
 rg "DSpark Attention enabled" "$RUN_ROOT"/*/*/*/run.log
 ```
 
-The candidate log must contain `warps_per_cta=2` and
-`dynamic_context_loop=True`; the baseline must contain `warps_per_cta=1` and
-`dynamic_context_loop=False`. Missing DSpark log lines make the run invalid.
+The candidate log must contain `warps_per_cta=1`,
+`dynamic_context_loop=True`, and the expected resolved `queries_per_warp`; the
+baseline must contain `warps_per_cta=1`, `dynamic_context_loop=False`, and
+`queries_per_warp=1`. Missing DSpark log lines make the run invalid.
 
 ## 4. Enforce exact output and DSpark AL
 

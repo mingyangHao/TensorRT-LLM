@@ -23,7 +23,7 @@ _VALID_WARPS_PER_CTA = (1, 2, 4, 8)
 
 
 def _get_dspark_attention_warps_per_cta() -> int:
-    """Return the acceptance-preserving packed-warp tuning knob."""
+    """Return the acceptance-preserving head-warp packing knob."""
     value = int(os.environ.get("TRTLLM_DSPARK_ATTENTION_WARPS_PER_CTA", "1"))
     if value not in _VALID_WARPS_PER_CTA:
         raise ValueError(
@@ -34,12 +34,34 @@ def _get_dspark_attention_warps_per_cta() -> int:
 
 
 def _get_dspark_attention_dynamic_context_loop() -> bool:
-    value = os.environ.get("TRTLLM_DSPARK_ATTENTION_DYNAMIC_CONTEXT_LOOP", "0")
+    value = os.environ.get("TRTLLM_DSPARK_ATTENTION_DYNAMIC_CONTEXT_LOOP", "1")
     if value not in ("0", "1"):
         raise ValueError(
             f"TRTLLM_DSPARK_ATTENTION_DYNAMIC_CONTEXT_LOOP must be 0 or 1; got {value}"
         )
     return value == "1"
+
+
+def _get_dspark_attention_queries_per_warp(block_size: int, batch_size: int) -> int:
+    override = os.environ.get("TRTLLM_DSPARK_ATTENTION_QUERIES_PER_WARP")
+    if override is None or override == "auto":
+        # Fusing a complete draft block wins once there are enough requests to
+        # populate the GPU.  DL4 uses a two-query tile: its smaller live state
+        # preserves occupancy and is faster than a four-query tile.  The small-
+        # batch path retains one query per warp to avoid a wave-quantization
+        # regression.  Both paths share a batch-symbolic compiled kernel.
+        if block_size == 4:
+            return 2 if batch_size >= 4 else 1
+        if block_size == 5:
+            return 5 if batch_size >= 8 else 1
+        if block_size == 6:
+            return 6 if batch_size >= 4 else 1
+        return 1
+
+    value = int(override)
+    if value < 1:
+        raise ValueError(f"TRTLLM_DSPARK_ATTENTION_QUERIES_PER_WARP must be positive; got {value}")
+    return value
 
 
 def is_fused_dspark_attention_supported(
@@ -100,10 +122,13 @@ def _compile_fused_dspark_attention(
     softmax_scale: float,
     warps_per_cta: int,
     dynamic_context_loop: bool,
+    queries_per_warp: int,
 ):
     # Batch is deliberately symbolic: DSpark's block/head geometry is fixed by
     # the model, while the generation batch changes from iteration to iteration.
-    # One warmup compile therefore covers every eager and CUDA-graph batch size.
+    # Each selected tactic therefore covers every eager and CUDA-graph batch
+    # size that resolves to it; the automatic policy currently selects at most
+    # two query-tile variants per draft length.
     batch_size = cute.sym_int()
     q_shape = (batch_size, block_size, num_heads, head_dim)
     q_fake = cute.runtime.make_fake_compact_tensor(
@@ -144,6 +169,7 @@ def _compile_fused_dspark_attention(
         softmax_scale=softmax_scale,
         warps_per_cta=warps_per_cta,
         dynamic_context_loop=dynamic_context_loop,
+        queries_per_warp=queries_per_warp,
     )
     return cute.compile(
         kernel,
@@ -186,19 +212,27 @@ def cute_dsl_dspark_attention(
     output = torch.empty_like(q)
     warps_per_cta = _get_dspark_attention_warps_per_cta()
     dynamic_context_loop = _get_dspark_attention_dynamic_context_loop()
+    queries_per_warp = _get_dspark_attention_queries_per_warp(q.shape[1], q.shape[0])
     if q.shape[2] % warps_per_cta != 0:
         raise ValueError(
             "DSpark Attention num_heads must be divisible by warps_per_cta; "
             f"got num_heads={q.shape[2]}, warps_per_cta={warps_per_cta}"
         )
+    if q.shape[1] % queries_per_warp != 0:
+        raise ValueError(
+            "DSpark Attention queries_per_warp must divide the draft block; "
+            f"got block={q.shape[1]}, queries_per_warp={queries_per_warp}"
+        )
     logger.info_once(
-        "DSpark Attention enabled: implementation=packed_warp, "
+        "DSpark Attention enabled: implementation=dspark_attn, "
         f"warps_per_cta={warps_per_cta}, dynamic_context_loop={dynamic_context_loop}, "
+        f"queries_per_warp={queries_per_warp}, "
         f"block={q.shape[1]}, "
         f"heads={q.shape[2]}, head_dim={q.shape[3]}",
         key=(
-            f"dspark_attention_packed_warp|warps_per_cta={warps_per_cta}|"
+            f"dspark_attention|warps_per_cta={warps_per_cta}|"
             f"dynamic_context_loop={dynamic_context_loop}|block={q.shape[1]}"
+            f"|queries_per_warp={queries_per_warp}"
         ),
     )
     compiled = _compile_fused_dspark_attention(
@@ -211,6 +245,7 @@ def cute_dsl_dspark_attention(
         softmax_scale,
         warps_per_cta,
         dynamic_context_loop,
+        queries_per_warp,
     )
     compiled(q, main_kv, block_kv, kv_cache, slots, start_pos, attn_sink, output)
     return output

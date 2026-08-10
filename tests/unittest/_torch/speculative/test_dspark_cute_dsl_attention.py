@@ -53,11 +53,18 @@ def _reference(q, main_kv, block_kv, kv_cache, slots, start_pos, sink):
     return dspark_sparse_attn(q, kv_full, sink, topk, q.shape[-1] ** -0.5), cache
 
 
-def _set_tactic(monkeypatch, *, warps_per_cta: int, dynamic_context_loop: bool) -> None:
+def _set_tactic(
+    monkeypatch,
+    *,
+    warps_per_cta: int,
+    dynamic_context_loop: bool,
+    queries_per_warp: int = 1,
+) -> None:
     monkeypatch.setenv("TRTLLM_DSPARK_ATTENTION_WARPS_PER_CTA", str(warps_per_cta))
     monkeypatch.setenv(
         "TRTLLM_DSPARK_ATTENTION_DYNAMIC_CONTEXT_LOOP", str(int(dynamic_context_loop))
     )
+    monkeypatch.setenv("TRTLLM_DSPARK_ATTENTION_QUERIES_PER_WARP", str(queries_per_warp))
 
 
 def _assert_bitwise_equal(actual: torch.Tensor, expected: torch.Tensor) -> None:
@@ -122,6 +129,29 @@ def _target_trace(draft_tokens: torch.Tensor, step: int) -> tuple[torch.Tensor, 
     return target_tokens, (accepted_drafts + 1).to(torch.int32)
 
 
+@pytest.mark.parametrize(
+    ("block", "batch", "expected"),
+    (
+        (4, 3, 1),
+        (4, 4, 2),
+        (5, 7, 1),
+        (5, 8, 5),
+        (6, 3, 1),
+        (6, 4, 6),
+    ),
+)
+def test_dspark_attention_auto_query_tile(monkeypatch, block, batch, expected):
+    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
+        _get_dspark_attention_queries_per_warp,
+    )
+
+    monkeypatch.delenv("TRTLLM_DSPARK_ATTENTION_QUERIES_PER_WARP", raising=False)
+    assert _get_dspark_attention_queries_per_warp(block, batch) == expected
+
+    monkeypatch.setenv("TRTLLM_DSPARK_ATTENTION_QUERIES_PER_WARP", "auto")
+    assert _get_dspark_attention_queries_per_warp(block, batch) == expected
+
+
 def test_cute_dsl_dspark_attention_matches_reference():
     from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import cute_dsl_dspark_attention
 
@@ -182,7 +212,12 @@ def test_candidate_cuda_graph_replay_is_bitwise_equal(monkeypatch, block):
     baseline_cache = initial_cache.clone()
     candidate_cache = initial_cache.clone()
 
-    _set_tactic(monkeypatch, warps_per_cta=2, dynamic_context_loop=True)
+    _set_tactic(
+        monkeypatch,
+        warps_per_cta=1,
+        dynamic_context_loop=True,
+        queries_per_warp={4: 2, 5: 5, 6: 6}[block],
+    )
     warmup_cache = initial_cache.clone()
     cute_dsl_dspark_attention(
         q,
@@ -405,7 +440,12 @@ def test_candidate_stateful_trace_preserves_exact_acceptance_length(monkeypatch,
             sink,
             scale,
         )
-        _set_tactic(monkeypatch, warps_per_cta=2, dynamic_context_loop=True)
+        _set_tactic(
+            monkeypatch,
+            warps_per_cta=1,
+            dynamic_context_loop=True,
+            queries_per_warp={4: 2, 5: 5, 6: 6}[block],
+        )
         candidate = cute_dsl_dspark_attention(
             q,
             main_kv,
